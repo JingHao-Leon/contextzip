@@ -930,8 +930,8 @@ This project uses [Semantic Versioning](https://semver.org/).
 - **A `.env` you deliberately include now has every value redacted.**
   Secret files (`.env`, private keys, credential files, Terraform state and
   so on) are still left out by default. You can still bring one back with
-  `always_include` in `.contextzip/config.json` or with
-  `contextzip config --ui`, so the AI can see which variables your app
+  `contextzip include .env`, `always_include` in `.contextzip/config.json`
+  or `contextzip config --ui`, so the AI can see which variables your app
   expects. It is now never zipped as-is:
   - `.env` / `.env.*` files keep every key, comment and blank line, but
     every value becomes `[REDACTED]`. Multi-line quoted values collapse to
@@ -945,9 +945,22 @@ This project uses [Semantic Versioning](https://semver.org/).
     file's size. It applies to normal runs, `--git-changes`, `--prompt`,
     the `source-files.zip` inside `contextzip watch`'s debug package, and
     the Python API.
+- **`contextzip include` / `--include` now brings back paths you name
+  explicitly**, even when the rules exclude them. `contextzip include .env`,
+  `include dist/` and `include some-gitignored-file.txt` all work now.
+  Previously they quietly matched nothing. Excluded folders nested inside a
+  named folder are still skipped (`include dist/` leaves out
+  `dist/node_modules/`). Naming an ordinary folder still only narrows the
+  run, so `include src/` doesn't pull in `src/.env`. The CLI prints a line
+  when this happens, and secret files are redacted as described above.
+  This also works with `--git-changes` and the Python API's `get_files()`.
+- Include paths now accept a leading `./` or `.\` (`contextzip include ./src`).
 - The scan report now groups repeated redactions (`.env value x3`).
 
 ### Fixed
+- The "Don't see your language?" hint shown for undetected projects linked
+  to a placeholder (`https://example.com`). It now points to
+  <https://contextzip.vercel.app/request-language>.
 - **The report didn't list files that couldn't be written to the ZIP**,
   even though the CLI said "see report". They now appear under "Left out
   of the ZIP" with the reason.

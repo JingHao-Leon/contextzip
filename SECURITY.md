@@ -41,9 +41,9 @@ There is no telemetry, analytics or background "phone home".
 
 contextzip protects secrets in three layers:
 
-1. **Secret files are excluded by default.** `.env` and `.env.*`, private keys (`*.pem`, `*.key`, `id_rsa`, `id_ed25519`, …), keystores, `.npmrc` / `.netrc` / `.pypirc` / `.pgpass`, Docker auth config, AWS credentials, service-account and `*credentials*.json` files, kubeconfigs and Terraform state are left out of every run, including `--git-changes`. CLI flags and `.gitignore` can't bring them back.
+1. **Secret files are excluded by default.** `.env` and `.env.*`, private keys (`*.pem`, `*.key`, `id_rsa`, `id_ed25519`, …), keystores, `.npmrc` / `.netrc` / `.pypirc` / `.pgpass`, Docker auth config, AWS credentials, service-account and `*credentials*.json` files, kubeconfigs and Terraform state are left out of every run, including `--git-changes`. Including a folder (`contextzip include src/`) doesn't bring back the secret files inside it.
 
-2. **Secret files you include on purpose are always redacted.** You can bring one of these files back by listing it under `always_include` in `.contextzip/config.json` (or ticking it in `contextzip config --ui`). This is useful when you want the AI to see which environment variables your app expects. Such a file is never zipped as-is, whatever your other settings say:
+2. **Secret files you include on purpose are always redacted.** You can bring one of these files back by naming it explicitly (`contextzip include .env`), listing it under `always_include` in `.contextzip/config.json`, or ticking it in `contextzip config --ui`. This is useful when you want the AI to see which environment variables your app expects. Such a file is never zipped as-is, whatever your other settings say:
    - In `.env` files every key, comment and blank line is kept, and **every value is replaced with `[REDACTED]`**.
    - Other secret files are scanned for private-key blocks, API keys, tokens and similar values, and the matches are replaced with `[REDACTED]`.
    - A secret file that isn't text (for example `.p12` or `.jks`) can't be redacted, so it is left out and listed in the report.

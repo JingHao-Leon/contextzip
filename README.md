@@ -90,6 +90,7 @@ contextzip --dry-run --verbose              # preview every included/excluded fi
 contextzip --git-changes                    # only what you've changed
 contextzip --prompt "fix the login redirect bug"   # let AI pick the relevant files
 contextzip include src/ app/                # only these folders
+contextzip include src/ .env                # .env too, values redacted
 contextzip exclude tests/ '*.snap'          # everything except these
 contextzip apply-zip                        # write the AI's changes back
 ```
@@ -198,7 +199,7 @@ This opens a local browser tab where you can tick files and folders to always in
 
 | Flag | Short | Description |
 |---|---|---|
-| `--include PATH` | `-i` | Only include files under these paths. Repeatable. |
+| `--include PATH` | `-i` | Only include files under these paths. Naming an excluded path (like `.env`) brings it back. Repeatable. |
 | `--exclude PATTERN` | `-e` | Extra exclusion patterns (gitignore syntax). Repeatable. |
 | `--prompt TEXT` | `-p` | Let Gemini select files relevant to this task. |
 | `--git-changes` | | Only include files git reports as changed. |
@@ -271,7 +272,7 @@ These patterns apply to **every** project, whatever its stack or `.gitignore` sa
 - **Binaries & media:** executables, shared libraries, images, video, audio and archives
 - **Project boilerplate:** `CHANGELOG`, `LICENSE`, `CONTRIBUTING`, `SECURITY.md`, `CODE_OF_CONDUCT.md`, GitHub issue/PR templates
 
-CLI flags and `.gitignore` can't override these. To bring one back, list it under `always_include` in the project config or tick it in `contextzip config --ui`.
+To bring one back, name it explicitly with `contextzip include .env`, list it under `always_include` in the project config, or tick it in `contextzip config --ui`. `--exclude` and `.gitignore` can't bring them back, and naming a folder like `src/` doesn't pull in the secret files inside it.
 
 **Secret files you include on purpose are always redacted.** If you include your `.env` so the AI can see which variables your app expects, every key and comment is kept but every value becomes `[REDACTED]`:
 
@@ -361,7 +362,7 @@ If the clipboard can't be used, contextzip opens the output folder with the ZIP 
 
 ## Contributing
 
-Contributions are welcome, especially **new framework rule sets** and edge-case fixes. To set up a local copy:
+Contributions are welcome, especially **new framework rule sets** and edge-case fixes. Not up for writing code? [Request a feature](https://contextzip.vercel.app/request-feature) or [request your language](https://contextzip.vercel.app/request-language). Both turn into GitHub issues ranked by 👍. To set up a local copy:
 
 ```bash
 git clone https://github.com/akadeepesh/contextzip

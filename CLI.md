@@ -37,7 +37,7 @@ These flags work on the main command **and** on `include` and `exclude`. Flags g
 
 | Flag | Short | Description |
 |---|---|---|
-| `--include PATH` | `-i` | Only include files under these paths (relative to the project root). Repeatable. Same as `contextzip include`. |
+| `--include PATH` | `-i` | Only include files under these paths (relative to the project root). Naming a path the rules exclude, like `.env`, brings it back. Repeatable. Same as `contextzip include`. |
 | `--exclude PATTERN` | `-e` | Extra exclusion patterns on top of the automatic rules (gitignore syntax). Repeatable. Same as `contextzip exclude`. |
 | `--prompt TEXT` | `-p` | Describe your task in plain language; Gemini selects only the relevant files. Needs a free Gemini API key (you're guided through setup on first use). |
 | `--dry-run` | `-n` | Show what would be included without creating the ZIP. |
@@ -71,7 +71,13 @@ contextzip include PATH…  [run flags]
 
 contextzip include src/ app/
 contextzip include src/ app/ --dry-run
+contextzip include src/ .env            # bring back a file the rules exclude
+contextzip include dist/                # or a whole excluded folder
 ```
+
+Paths match at folder boundaries: `src` matches `src/index.ts` but not `src2/index.ts`. Leading `./` or `.\` is ignored.
+
+**Naming an excluded path brings it back.** If a path you name is itself excluded (by the built-in rules, `.gitignore` or `always_exclude`), it is included anyway, because you asked for it explicitly. Inside a named folder, excluded folders nested deeper are still skipped (`include dist/` leaves out `dist/node_modules/`). Naming an ordinary folder only narrows the run: `include src/` does **not** pull in `src/.env`. Secret files brought back this way, such as `.env`, keep their keys but have every value replaced with `[REDACTED]`. The same applies to `--include` / `-i`.
 
 ## `contextzip exclude`
 

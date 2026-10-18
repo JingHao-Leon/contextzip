@@ -924,7 +924,7 @@ This project uses [Semantic Versioning](https://semver.org/).
 
 ---
 
-## [Unreleased]
+## [0.4.7] — 2026-10-19
 
 ### Changed
 - **A `.env` you deliberately include now has every value redacted.**

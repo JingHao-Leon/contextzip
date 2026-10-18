@@ -584,6 +584,7 @@ def _write_debug_zip(
     from contextzip.packager import (
         _workspace_dir,
         _ensure_workspace_gitignore,
+        _write_member,
         output_subdir_for_mode,
     )
 
@@ -622,8 +623,13 @@ def _write_debug_zip(
                 ) as inner_zf:
                     for abs_path in referenced_paths:
                         try:
-                            rel = abs_path.relative_to(project_dir).as_posix()
-                            inner_zf.write(abs_path, arcname=rel)
+                            rel = abs_path.relative_to(project_dir)
+                            # Same writer as a normal run, so a secret file
+                            # (e.g. a .env named in a traceback) is redacted
+                            # or left out, never zipped as-is.
+                            _write_member(
+                                inner_zf, abs_path, rel, False, frozenset(), frozenset()
+                            )
                         except (ValueError, OSError):
                             pass  # skip files we can't read or locate
                 zf.writestr("source-files.zip", inner_buf.getvalue())

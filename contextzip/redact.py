@@ -7,14 +7,27 @@ enforced by the packaging logic — see the 0.4.0 changelog's "known
 limitation."
 
 This is deliberately a *second line of defense*, not a replacement for the
-hard secrets/credentials exclusion list in packager.py's universal baseline.
-That list keeps whole files that are almost certainly secrets (private keys,
-credential files, .env) out of the archive entirely, unconditionally, and
-that behavior is unchanged. This module instead handles the narrower case
-those file-level rules can't catch: an ordinary source or config file that's
-fine to include, but happens to have a secret-shaped value hardcoded
-somewhere inside it (e.g. an AWS key pasted into a settings.py for local
-testing).
+secrets/credentials exclusion list (rules/base.py's SECRET_PATTERNS). That
+list keeps whole files that are almost certainly secrets (private keys,
+credential files, .env) out of the archive by default. This module instead
+handles the narrower case those file-level rules can't catch: an ordinary
+source or config file that's fine to include, but happens to have a
+secret-shaped value hardcoded somewhere inside it (e.g. an AWS key pasted
+into a settings.py for local testing).
+
+Secret files the user deliberately includes
+───────────────────────────────────────────
+A project's `always_include` can bring a SECRET_PATTERNS file back on
+purpose — most often a `.env`, so the AI tool can see which variables the
+app expects. Those files are never written as-is (see redact_sensitive_file,
+called unconditionally by packager.py, whatever `limits.redact_secrets`
+says):
+  - `.env` / `.env.*` files keep every key, comment and blank line, but
+    every value becomes "[REDACTED]" — not just the secret-shaped ones,
+    because a dotenv value is a secret far too often to guess which aren't.
+  - Any other secret file gets the same pattern scan as above.
+  - A secret file that isn't UTF-8 text (a .p12, a .jks keystore) can't be
+    redacted, so packager.py skips it instead of zipping it raw.
 
 Design choices, deliberately conservative to match the rest of the project:
   - A curated list of high-precision patterns (known key/token formats,
@@ -28,10 +41,12 @@ Design choices, deliberately conservative to match the rest of the project:
     left alone rather than redacted, so example/template files don't get
     needlessly mangled.
 
-Performance: this only ever runs on files the caller has already confirmed
-are text and within `limits.max_file_size_mb` (see packager.py, which reuses
-the binary/large-file classification `resolve_files()` already computes) —
-never on binaries or oversized files. A handful of compiled regexes over a
+Performance: the opt-in scan only ever runs on files the caller has already
+confirmed are text and within `limits.max_file_size_mb` (see packager.py,
+which reuses the binary/large-file classification `resolve_files()` already
+computes) — never on binaries or oversized files. Deliberately included
+secret files are the one exception: they're always scanned, whatever their
+size. A handful of compiled regexes over a
 small text file costs low-single-digit milliseconds; across an entire
 project it's negligible next to the I/O of zipping in the first place.
 """
@@ -40,6 +55,13 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass
+from pathlib import PurePath
+
+import pathspec
+
+from contextzip.rules.base import SECRET_PATTERNS
+
+REDACTED = "[REDACTED]"
 
 
 @dataclass(frozen=True)
@@ -173,3 +195,143 @@ def redact_secrets(text: str) -> tuple[str, list[str]]:
         text = pattern.regex.sub(_sub, text)
 
     return text, matched_names
+
+
+# ---------------------------------------------------------------------------
+# Secret files the user deliberately included (see module docstring)
+# ---------------------------------------------------------------------------
+
+_SECRET_SPEC = pathspec.PathSpec.from_lines("gitwildmatch", SECRET_PATTERNS)
+
+# KEY=value, optionally prefixed with `export` — the dotenv assignment form.
+_ENV_ASSIGNMENT = re.compile(r"^(\s*(?:export\s+)?[A-Za-z_][A-Za-z0-9_.\-]*\s*=[ \t]*)(.*)$")
+
+ENV_VALUE = ".env value"
+
+
+def is_sensitive_path(rel: PurePath | str) -> bool:
+    """True if *rel* (relative to the project root) matches SECRET_PATTERNS."""
+    rel_str = PurePath(rel).as_posix()
+    if _SECRET_SPEC.match_file(rel_str):
+        return True
+    parts = PurePath(rel_str).parts[:-1]
+    return any(
+        _SECRET_SPEC.match_file("/".join(parts[: i + 1]) + "/") for i in range(len(parts))
+    )
+
+
+def is_env_file(rel: PurePath | str) -> bool:
+    """True for `.env` and `.env.*` files (`.env.local`, `.env.production`, ...)."""
+    name = PurePath(rel).name
+    return name == ".env" or name.startswith(".env.")
+
+
+def _split_line_ending(line: str) -> tuple[str, str]:
+    body = line.rstrip("\r\n")
+    return body, line[len(body):]
+
+
+def _closing_quote(value: str, quote: str, start: int) -> int:
+    """Index of the closing *quote* in *value* at or after *start*, or -1."""
+    i = start
+    while i < len(value):
+        if value[i] == "\\" and quote == '"':
+            i += 2
+            continue
+        if value[i] == quote:
+            return i
+        i += 1
+    return -1
+
+
+def _safe_tail(tail: str) -> str:
+    """Keep what follows a closing quote only if it's blank or a `#comment`."""
+    if not tail.strip() or re.match(r"\s+#", tail):
+        return tail
+    return " " + REDACTED
+
+
+def redact_env(text: str) -> tuple[str, int]:
+    """
+    Replace every value in a dotenv file with "[REDACTED]".
+
+    Keys, `export` prefixes, quotes, inline comments, blank lines and line
+    endings are kept, so the file still tells the reader which variables
+    exist. Quoted values that span several lines collapse to one redacted
+    line. Any other non-comment line (something that isn't KEY=value) is
+    redacted whole, since it might be a pasted secret.
+
+    Returns (redacted text, number of values redacted).
+    """
+    lines = text.splitlines(keepends=True)
+    out: list[str] = []
+    count = 0
+    i = 0
+
+    while i < len(lines):
+        body, ending = _split_line_ending(lines[i])
+        i += 1
+        stripped = body.strip()
+
+        if not stripped or stripped.startswith("#"):
+            out.append(body + ending)
+            continue
+
+        m = _ENV_ASSIGNMENT.match(body)
+        if not m:
+            out.append(REDACTED + ending)
+            count += 1
+            continue
+
+        prefix, value = m.group(1), m.group(2)
+        if not value.strip():
+            out.append(body + ending)
+            continue
+
+        count += 1
+        quote = value[0]
+        if quote not in "\"'`":
+            # Unquoted: the value runs up to an inline ` #comment`.
+            comment = re.search(r"\s+#.*$", value)
+            tail = comment.group(0) if comment else ""
+            out.append(prefix + REDACTED + tail + ending)
+            continue
+
+        close = _closing_quote(value, quote, 1)
+        if close != -1:
+            out.append(prefix + quote + REDACTED + quote + _safe_tail(value[close + 1:]) + ending)
+            continue
+
+        # Multi-line quoted value: swallow lines until the closing quote.
+        tail = None
+        while i < len(lines):
+            next_body, ending = _split_line_ending(lines[i])
+            i += 1
+            close = _closing_quote(next_body, quote, 0)
+            if close != -1:
+                tail = next_body[close + 1:]
+                break
+        if tail is None:
+            # Never closed — everything after the opening quote is the value.
+            out.append(prefix + REDACTED + ending)
+        else:
+            out.append(prefix + quote + REDACTED + quote + _safe_tail(tail) + ending)
+
+    return "".join(out), count
+
+
+def redact_sensitive_file(rel: PurePath | str, text: str) -> tuple[str, list[str]]:
+    """
+    Redact a SECRET_PATTERNS file the user deliberately included.
+
+    `.env` files get every value redacted (see redact_env); any other secret
+    file gets the regular pattern scan. Returns the same shape as
+    redact_secrets(), with one ENV_VALUE entry per redacted dotenv value.
+    """
+    names: list[str] = []
+    if is_env_file(rel):
+        text, count = redact_env(text)
+        names.extend([ENV_VALUE] * count)
+    text, matched = redact_secrets(text)
+    names.extend(matched)
+    return text, names

@@ -77,7 +77,7 @@ from rich.progress import (
 )
 
 from contextzip.filters import ResolveResult
-from contextzip.redact import redact_secrets
+from contextzip.redact import is_sensitive_path, redact_secrets, redact_sensitive_file
 
 # Subdirectory of the workspace where generated ZIPs are written.
 _OUTPUT_DIRNAME = "output"
@@ -161,7 +161,8 @@ class PackageResult:
     skipped_in_zip: list[tuple[Path, str]] = field(default_factory=list)
     # Files where at least one secret-shaped value was redacted before
     # writing — (path relative to project root, pattern names matched).
-    # Always empty unless limits.redact_secrets is enabled.
+    # Empty unless limits.redact_secrets is enabled or a secret file such
+    # as .env was deliberately included (those are always redacted).
     redacted: list[tuple[Path, list[str]]] = field(default_factory=list)
 
     @property
@@ -184,6 +185,14 @@ class PackageResult:
 # ---------------------------------------------------------------------------
 
 
+class UnredactableSecretFile(OSError):
+    """A deliberately included secret file that can't be redacted (not text).
+
+    An OSError so every caller's existing `except OSError` records it as a
+    skipped file with this message as the reason.
+    """
+
+
 def _write_member(
     zf: zipfile.ZipFile,
     abs_path: Path,
@@ -202,10 +211,30 @@ def _write_member(
     that fails to decode as UTF-8, are written unmodified via the same
     fast zf.write() path used when redaction is off entirely.
 
+    Secret files (rules/base.py's SECRET_PATTERNS — only here because a
+    project's `always_include` brought them back on purpose) are always
+    redacted, whatever *redact_enabled* says and whatever their size — see
+    redact.redact_sensitive_file. One that isn't UTF-8 text can't be
+    redacted, so it raises UnredactableSecretFile and is left out.
+
     Returns the list of pattern names redacted (empty if none matched, or
     if this file wasn't eligible for scanning). May raise OSError, exactly
     as the old plain zf.write() call did — callers already handle that.
     """
+    if is_sensitive_path(rel):
+        data = abs_path.read_bytes()
+        try:
+            if abs_path in binary_paths or b"\x00" in data:
+                raise UnicodeDecodeError("utf-8", data, 0, 0, "binary")
+            text = data.decode("utf-8")
+        except UnicodeDecodeError:
+            raise UnredactableSecretFile(
+                "secret file that isn't text can't be redacted, so it was left out"
+            ) from None
+        redacted_text, matched = redact_sensitive_file(rel, text)
+        zf.writestr(rel.as_posix(), redacted_text.encode("utf-8"))
+        return matched
+
     if not redact_enabled or abs_path in binary_paths or abs_path in large_paths:
         zf.write(abs_path, arcname=rel.as_posix())
         return []

@@ -103,6 +103,10 @@ class ResolveResult:
     skipped: list[tuple[Path, str]] = field(default_factory=list)  # (path, reason)
     large_files: list[tuple[Path, int]] = field(default_factory=list)  # (path, bytes)
     binary_files: list[Path] = field(default_factory=list)
+    # Files the rules would have excluded, included anyway because an
+    # explicit --include / `contextzip include` path named them (see
+    # _explicit_include_override). Also present in `included`.
+    explicitly_included: list[Path] = field(default_factory=list)
 
 
 # ---------------------------------------------------------------------------
@@ -307,6 +311,11 @@ def resolve_files(
     an explicit `contextzip include PATH` for this run still has the final
     say on what actually gets included.
 
+    *include_only* narrows the run to those paths. Naming a path the rules
+    exclude (`contextzip include .env`, `include dist/`) brings it back —
+    see :func:`_explicit_include_override` — and those files are also
+    listed in ``explicitly_included``.
+
     *large_file_warn_bytes* overrides the module default (1 MB) — typically
     a project's `limits.max_file_size_mb` preference (.contextzip/config.json).
 
@@ -352,13 +361,13 @@ def resolve_files(
         )
 
         if not forced:
-            # ── Check directory-level exclusion ──────────────────────────────
-            if _any_parent_excluded(rel, spec):
-                result.excluded.append(abs_path)
-                continue
-
-            # ── Check file-level exclusion ─────────────────────────────────
-            if spec.match_file(rel_str):
+            excluded = _any_parent_excluded(rel, spec) or spec.match_file(rel_str)
+            if excluded and include_only:
+                # ── Explicitly named on --include: brings it back ────────────
+                if _explicit_include_override(rel, include_only, spec):
+                    result.explicitly_included.append(abs_path)
+                    excluded = False
+            if excluded:
                 result.excluded.append(abs_path)
                 continue
 
@@ -414,7 +423,9 @@ def resolve_files_from_git(
       2. Base safety floor + *extra_exclude* (CLI ``--exclude`` plus config
          ``always_exclude``) — a match excludes the file.
       3. *include_only* (CLI ``--include``) — the file must live under one of
-         these paths, even if it was force-included.
+         these paths, even if it was force-included. A path that is itself
+         excluded brings its files back when named here (see
+         :func:`_explicit_include_override`).
 
     Parameters
     ----------
@@ -475,8 +486,12 @@ def resolve_files_from_git(
         if not forced and (
             _any_parent_excluded(rel, base_spec) or base_spec.match_file(rel_str)
         ):
-            result.excluded.append(abs_path)
-            continue
+            # ── ...unless explicitly named on --include ──────────────────────
+            if include_only and _explicit_include_override(rel, include_only, base_spec):
+                result.explicitly_included.append(abs_path)
+            else:
+                result.excluded.append(abs_path)
+                continue
 
         # ── Apply --include filter (exact prefix, not substring) ─────────────
         if include_only and not _matches_any_prefix(rel_str, include_only):
@@ -579,6 +594,52 @@ def _any_parent_excluded(rel: Path, spec: pathspec.PathSpec) -> bool:
     return False
 
 
+def _clean_include_path(p: str) -> str:
+    """`./src/`, `.\\src\\` and `src` all become `src`."""
+    p = p.replace("\\", "/")
+    while p.startswith("./"):
+        p = p[2:]
+    return p.rstrip("/")
+
+
+def _explicit_include_override(
+    rel: Path, include_only: list[str], spec: pathspec.PathSpec
+) -> bool:
+    """
+    True if an excluded file should be included anyway because the user
+    named it — or a folder holding it — on --include / `contextzip include`.
+
+    That only counts when the named path is *itself* excluded by the rules:
+    `contextzip include .env` or `include dist/` brings those back, but
+    `include src/` doesn't drag in `src/.env`, since src/ was never excluded
+    and the user just meant "scope to src/". Under a named folder, excluded
+    folders *nested inside it* still apply (`include dist/` skips
+    `dist/node_modules/`), matched relative to the named folder. Secret
+    files brought back this way are still redacted by the packager.
+    """
+    rel_str = rel.as_posix()
+    for raw in include_only:
+        named = _clean_include_path(raw)
+        if not named or not (rel_str == named or rel_str.startswith(named + "/")):
+            continue
+
+        named_path = Path(named)
+        named_is_excluded = (
+            spec.match_file(named)
+            or spec.match_file(named + "/")
+            or _any_parent_excluded(named_path, spec)
+        )
+        if not named_is_excluded:
+            continue
+        if rel_str == named:
+            return True
+
+        inner = rel.relative_to(named_path)
+        if not _any_parent_excluded(inner, spec):
+            return True
+    return False
+
+
 def _matches_any_prefix(rel_str: str, prefixes: list[str]) -> bool:
     """
     True if *rel_str* starts with one of *prefixes* at a path boundary.
@@ -588,7 +649,7 @@ def _matches_any_prefix(rel_str: str, prefixes: list[str]) -> bool:
     ``src`` does NOT match ``src2/...`` ✗
     """
     for prefix in prefixes:
-        p = prefix.rstrip("/")
+        p = _clean_include_path(prefix)
         if rel_str == p:
             return True
         if rel_str.startswith(p + "/"):

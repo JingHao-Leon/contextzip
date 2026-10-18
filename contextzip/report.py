@@ -125,6 +125,13 @@ def write_scan_report(
             w(f"  {rel.as_posix():<60} {summary}")
         w("")
 
+    explicit = getattr(resolved, "explicitly_included", None)
+    if explicit:
+        w("Included because you named them (normally excluded)")
+        for p in explicit:
+            w(f"  {p.relative_to(project_dir).as_posix()}")
+        w("")
+
     if skipped_in_zip:
         w("Left out of the ZIP")
         for p, reason in skipped_in_zip:

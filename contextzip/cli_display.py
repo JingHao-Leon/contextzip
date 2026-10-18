@@ -165,6 +165,15 @@ def print_scan_summary(
 # ---------------------------------------------------------------------------
 
 
+def _is_secret(path: Path, project_dir: Path) -> bool:
+    from contextzip.redact import is_sensitive_path
+
+    try:
+        return is_sensitive_path(path.relative_to(project_dir))
+    except ValueError:
+        return False
+
+
 def print_file_warnings(
     resolved,
     project_dir: Path,
@@ -173,6 +182,21 @@ def print_file_warnings(
     con: Console = console,
 ) -> None:
     """One line per warning category — no file listings inline (see report)."""
+    explicit = getattr(resolved, "explicitly_included", None)
+    if explicit:
+        n = len(explicit)
+        secret = sum(1 for p in explicit if _is_secret(p, project_dir))
+        detail = (
+            f" — {secret} secret file{'s' if secret != 1 else ''}, values will be redacted"
+            if secret
+            else ""
+        )
+        warn(
+            f"{n} normally excluded file{'s' if n != 1 else ''} included "
+            f"because you named {'them' if n != 1 else 'it'}{detail}",
+            con=con,
+        )
+
     if resolved.large_files:
         n = len(resolved.large_files)
         warn(

@@ -12,6 +12,7 @@ people who want it in-terminal without opening a file.
 from __future__ import annotations
 
 import datetime as _dt
+from collections import Counter
 from pathlib import Path
 
 from contextzip.filters import summarise_exclusions
@@ -35,6 +36,7 @@ def write_scan_report(
     ai_selected: list[Path] | None = None,
     large_file_warn_bytes: int,
     redacted: list[tuple[Path, list[str]]] | None = None,
+    skipped_in_zip: list[tuple[Path, str]] | None = None,
 ) -> Path:
     """
     Write the full scan/package report next to *zip_path*.
@@ -114,9 +116,23 @@ def write_scan_report(
         w("")
 
     if redacted:
-        w("Redacted secrets (limits.redact_secrets)")
+        w("Redacted secrets")
         for rel, names in redacted:
-            w(f"  {rel.as_posix():<60} {', '.join(names)}")
+            counts = Counter(names)
+            summary = ", ".join(
+                f"{name} x{n}" if n > 1 else name for name, n in counts.items()
+            )
+            w(f"  {rel.as_posix():<60} {summary}")
+        w("")
+
+    if skipped_in_zip:
+        w("Left out of the ZIP")
+        for p, reason in skipped_in_zip:
+            try:
+                rel = p.relative_to(project_dir).as_posix()
+            except ValueError:
+                rel = str(p)
+            w(f"  {rel} — {reason}")
         w("")
 
     if resolved.skipped:

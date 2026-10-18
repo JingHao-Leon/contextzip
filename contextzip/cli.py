@@ -1107,6 +1107,7 @@ def _run(
         ai_selected=resolved.included if prompt else None,
         large_file_warn_bytes=large_file_warn_bytes,
         redacted=result.redacted,
+        skipped_in_zip=result.skipped_in_zip,
     )
     print_report_hint(report_path)
 

@@ -2,33 +2,12 @@
 Universal exclusion rules applied to every project regardless of language.
 """
 
-PATTERNS = [
-    # Version control
-    ".git/",
-    ".svn/",
-    ".hg/",
-    # OS artifacts
-    ".DS_Store",
-    "Thumbs.db",
-    "desktop.ini",
-    # Editor & IDE
-    ".vscode/",
-    ".idea/",
-    "*.swp",
-    "*.swo",
-    "*.swn",
-    ".vim/",
-    # Logs
-    "*.log",
-    "logs/",
-    "log/",
-    # Temp & cache
-    ".cache/",
-    "tmp/",
-    "temp/",
-    "*.tmp",
-    "*.bak",
-    "*.orig",
+# Files that hold secrets. Excluded on every run like the rest of PATTERNS,
+# but also used by redact.py: if a project's `always_include` deliberately
+# brings one of these back, its contents are always redacted before zipping
+# (whatever `limits.redact_secrets` says), and a binary one is skipped
+# because it can't be redacted.
+SECRET_PATTERNS = [
     # Secrets & env
     ".env",
     ".env.*",
@@ -67,6 +46,37 @@ PATTERNS = [
     "*.tfstate",
     "*.tfstate.*",
     ".terraform/",
+]
+
+PATTERNS = [
+    # Version control
+    ".git/",
+    ".svn/",
+    ".hg/",
+    # OS artifacts
+    ".DS_Store",
+    "Thumbs.db",
+    "desktop.ini",
+    # Editor & IDE
+    ".vscode/",
+    ".idea/",
+    "*.swp",
+    "*.swo",
+    "*.swn",
+    ".vim/",
+    # Logs
+    "*.log",
+    "logs/",
+    "log/",
+    # Temp & cache
+    ".cache/",
+    "tmp/",
+    "temp/",
+    "*.tmp",
+    "*.bak",
+    "*.orig",
+    # Secrets & credentials — see SECRET_PATTERNS above
+    *SECRET_PATTERNS,
     # Binaries & media (rarely useful for AI context)
     "*.exe",
     "*.dll",

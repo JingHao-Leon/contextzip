@@ -921,3 +921,39 @@ This project uses [Semantic Versioning](https://semver.org/).
   clipboard through, which GNOME and KDE do. A Wayland-only setup without
   XWayland needs `wl-clipboard` (`wl-copy`) installed; otherwise contextzip
   opens the folder and tells you what to install.
+
+---
+
+## [Unreleased]
+
+### Changed
+- **A `.env` you deliberately include now has every value redacted.**
+  Secret files (`.env`, private keys, credential files, Terraform state and
+  so on) are still left out by default. You can still bring one back with
+  `always_include` in `.contextzip/config.json` or with
+  `contextzip config --ui`, so the AI can see which variables your app
+  expects. It is now never zipped as-is:
+  - `.env` / `.env.*` files keep every key, comment and blank line, but
+    every value becomes `[REDACTED]`. Multi-line quoted values collapse to
+    one redacted line, and any line that isn't `KEY=value` is redacted
+    whole.
+  - Any other secret file gets the secret-pattern scan (private-key blocks,
+    API keys, tokens and so on).
+  - A secret file that isn't text (`.p12`, `.jks` and so on) can't be
+    redacted, so it is left out and listed in the report.
+  - This happens whatever `limits.redact_secrets` says and whatever the
+    file's size. It applies to normal runs, `--git-changes`, `--prompt`,
+    the `source-files.zip` inside `contextzip watch`'s debug package, and
+    the Python API.
+- The scan report now groups repeated redactions (`.env value x3`).
+
+### Fixed
+- **The report didn't list files that couldn't be written to the ZIP**,
+  even though the CLI said "see report". They now appear under "Left out
+  of the ZIP" with the reason.
+
+### Developer notes
+- `rules/base.py` has a new `SECRET_PATTERNS` list. `PATTERNS` still
+  contains it, so the default exclusions are unchanged.
+- New in `contextzip.redact`: `is_sensitive_path()`, `is_env_file()`,
+  `redact_env()` and `redact_sensitive_file()`.

@@ -28,7 +28,7 @@ contextzip does all of that for you. Run it from your project root and it:
 
 1. **Detects your stack** (Node.js, Next.js, Python, Django, FastAPI, Rust, Go, Ruby, monorepos included).
 2. **Excludes the noise**: dependencies, build output, caches, binaries, logs, and anything in your `.gitignore`.
-3. **Never packages secrets**: `.env` files, private keys, cloud credentials and Terraform state are always left out.
+3. **Keeps secrets out**: `.env` files, private keys, cloud credentials and Terraform state are left out by default. If you include your `.env` on purpose, its values are redacted.
 4. **Puts the ZIP on your clipboard** as a real file, so you can paste it straight into Claude, ChatGPT, Gemini or any other upload box.
 
 When the AI sends changed files back, `contextzip apply-zip` writes them into your project safely, and warns you before touching anything you've edited since.
@@ -271,7 +271,19 @@ These patterns apply to **every** project, whatever its stack or `.gitignore` sa
 - **Binaries & media:** executables, shared libraries, images, video, audio and archives
 - **Project boilerplate:** `CHANGELOG`, `LICENSE`, `CONTRIBUTING`, `SECURITY.md`, `CODE_OF_CONDUCT.md`, GitHub issue/PR templates
 
-The only way to bring one of these back is to list it explicitly under `always_include` in the project config. CLI flags and `.gitignore` can't override them. For extra safety, set `limits.redact_secrets: true` to mask API keys, tokens, JWTs and private-key blocks that are hardcoded inside files that *do* get included.
+CLI flags and `.gitignore` can't override these. To bring one back, list it under `always_include` in the project config or tick it in `contextzip config --ui`.
+
+**Secret files you include on purpose are always redacted.** If you include your `.env` so the AI can see which variables your app expects, every key and comment is kept but every value becomes `[REDACTED]`:
+
+```bash
+# .env on disk                          # .env in the ZIP
+DATABASE_URL=postgres://u:pw@db/app     DATABASE_URL=[REDACTED]
+export API_KEY="sk-live-…"  # prod      export API_KEY="[REDACTED]"  # prod
+```
+
+Other secret files (private keys, credential files) get a secret-pattern scan. Binary ones like `.p12` can't be redacted, so they're left out. All of this happens whatever your other settings say.
+
+For extra safety, set `limits.redact_secrets: true` to also mask API keys, tokens, JWTs and private-key blocks hardcoded inside ordinary files that get included. Every run's report lists what was redacted.
 
 > **Tip:** before sharing a sensitive project, run `contextzip --dry-run --verbose` to see exactly what will go into the ZIP.
 
@@ -333,6 +345,7 @@ For full signatures, see [contextzip.vercel.app/cli#python-api](https://contextz
   - `contextzip update` asks PyPI for the latest version number.
 - **No telemetry.** Nothing is collected or phoned home.
 - **Manifests stay local.** `apply-zip` manifests are written next to the ZIP and never inside it.
+- **Secrets are excluded or redacted.** See [What is always excluded](#what-is-always-excluded).
 
 Found a vulnerability? Please follow [SECURITY.md](https://github.com/akadeepesh/contextzip/blob/main/SECURITY.md) and report it privately rather than in a public issue.
 

@@ -1,26 +1,78 @@
-
-
-https://github.com/user-attachments/assets/91913ad6-6161-430d-9075-b0fa76498021
-
-<!-- <img width="1536" height="1024" alt="cz" src="https://github.com/user-attachments/assets/a930b49c-34a0-447b-8f3a-1909eae977c8" /> -->
+<div align="center">
 
 # contextzip
 
-> Package exactly the right parts of your codebase and paste it into any AI tool — in one command.
+**Package exactly the right parts of your codebase for any AI tool, in one command.**
+
+[![PyPI](https://img.shields.io/pypi/v/contextzip?color=blue)](https://pypi.org/project/contextzip/)
+[![Python](https://img.shields.io/pypi/pyversions/contextzip)](https://pypi.org/project/contextzip/)
+[![Downloads](https://static.pepy.tech/badge/contextzip/month)](https://pepy.tech/project/contextzip)
+[![License: MIT](https://img.shields.io/badge/license-MIT-green.svg)](https://github.com/akadeepesh/contextzip/blob/main/LICENSE)
+
+[Documentation](https://contextzip.vercel.app) ·
+[CLI reference](https://github.com/akadeepesh/contextzip/blob/main/CLI.md) ·
+[Changelog](https://github.com/akadeepesh/contextzip/blob/main/CHANGELOG.md) ·
+[Report a bug](https://github.com/akadeepesh/contextzip/issues/new/choose)
+
+</div>
+
+https://github.com/user-attachments/assets/91913ad6-6161-430d-9075-b0fa76498021
+
+---
+
+## Why contextzip?
+
+Every AI coding session starts the same way. You hunt down the relevant files, skip `node_modules` and build output by hand, zip it all, find the zip and upload it. Next session, you do it again.
+
+contextzip does all of that for you. Run it from your project root and it:
+
+1. **Detects your stack** (Node.js, Next.js, Python, Django, FastAPI, Rust, Go, Ruby, monorepos included).
+2. **Excludes the noise**: dependencies, build output, caches, binaries, logs, and anything in your `.gitignore`.
+3. **Never packages secrets**: `.env` files, private keys, cloud credentials and Terraform state are always left out.
+4. **Puts the ZIP on your clipboard** as a real file, so you can paste it straight into Claude, ChatGPT, Gemini or any other upload box.
+
+When the AI sends changed files back, `contextzip apply-zip` writes them into your project safely, and warns you before touching anything you've edited since.
+
+## Table of contents
+
+- [Installation](#installation)
+- [Quick start](#quick-start)
+- [Features](#features)
+  - [Smart packaging](#smart-packaging)
+  - [Package only what changed](#package-only-what-changed)
+  - [AI-powered file selection](#ai-powered-file-selection)
+  - [Applying AI changes back](#applying-ai-changes-back)
+  - [Terminal error watcher](#terminal-error-watcher)
+  - [Visual config UI](#visual-config-ui)
+- [Command reference](#command-reference)
+- [Configuration](#configuration)
+- [What is always excluded](#what-is-always-excluded)
+- [Where files go](#where-files-go)
+- [Python API](#python-api)
+- [Privacy & security](#privacy--security)
+- [Platform support](#platform-support)
+- [Contributing](#contributing)
+- [License](#license)
+
+## Installation
+
+contextzip needs **Python 3.9 or newer**.
 
 ```bash
 pip install contextzip
 ```
 
-**📖 Full docs, every flag, every config option: [contextzip.vercel.app](https://contextzip.vercel.app)**
+Installing with [pipx](https://pipx.pypa.io/) or [uv](https://docs.astral.sh/uv/) keeps it isolated from your projects:
 
----
+```bash
+pipx install contextzip
+# or
+uv tool install contextzip
+```
 
-## Why contextzip
+This installs two commands that do the same thing: `contextzip` and the shorter `cz`.
 
-Every AI session starts the same way: hunt down the relevant files, skip `node_modules` and build artifacts by hand, zip it, find the zip, upload it — then do it all again next session.
-
-contextzip eliminates that. Run it from your project root — it detects your stack, applies smart exclusions, and produces a lean ZIP ready to paste into Claude, ChatGPT, or any AI tool. When the AI hands changes back, `contextzip apply-zip` writes them into your project safely.
+To update later, run `contextzip update`. It works out whether you installed with pip, pipx or uv and upgrades the right one.
 
 ## Quick start
 
@@ -29,47 +81,285 @@ cd ~/projects/my-app
 contextzip
 ```
 
-That's it — no flags required. contextzip detects your framework, excludes the noise, and writes a ZIP to `.contextzip/`.
+You don't need any flags. contextzip detects your framework, excludes the noise, writes `codebase.zip` into `.contextzip/output/codebase/` and copies it to your clipboard. Paste it into your AI tool.
 
-## The essentials
+Some other common runs:
+
+```bash
+contextzip --dry-run --verbose              # preview every included/excluded file, write nothing
+contextzip --git-changes                    # only what you've changed
+contextzip --prompt "fix the login redirect bug"   # let AI pick the relevant files
+contextzip include src/ app/                # only these folders
+contextzip exclude tests/ '*.snap'          # everything except these
+contextzip apply-zip                        # write the AI's changes back
+```
+
+## Features
+
+### Smart packaging
+
+contextzip scans your project and recognises its stack from marker files such as `package.json`, `next.config.*`, `pyproject.toml`, `manage.py`, `Cargo.toml`, `go.mod` and `Gemfile`. It looks a couple of levels deep, so a monorepo with a Next.js frontend and a FastAPI backend gets **both** rule sets applied.
+
+| Ecosystem | Examples of what's excluded |
+|---|---|
+| **Node.js / Next.js** | `node_modules/`, `.next/`, `dist/`, `build/`, `coverage/`, lockfiles, `*.min.js` |
+| **Python / Django / FastAPI** | `__pycache__/`, `.venv/`, `*.pyc`, `.pytest_cache/`, `*.egg-info/` |
+| **Rust** | `target/`, `Cargo.lock`, `*.rlib` |
+| **Go** | `vendor/`, `bin/`, `go.sum` |
+| **Ruby / Rails** | `vendor/bundle/`, `tmp/`, `log/`, `storage/`, built gems |
+
+On top of the stack rules, contextzip also:
+
+- respects your `.gitignore` (turn this off with `--no-gitignore`),
+- flags large files (1 MB or more by default) and binary files before packaging,
+- skips dangling symlinks and unreadable files, and tells you why,
+- writes a plain-text report next to every ZIP listing what went in and what was left out.
+
+### Package only what changed
+
+```bash
+contextzip --git-changes
+```
+
+This packages only the files git reports as **staged, modified or untracked**. It's ideal for code review or "here's what I changed, what's wrong?" prompts. Deleted files, submodules and monorepo roots are handled for you, and the secret-exclusion rules still apply to files git tracks.
+
+### AI-powered file selection
+
+```bash
+contextzip --prompt "add rate limiting to the login endpoint"
+```
+
+Describe your task in plain language and [Gemini](https://ai.google.dev/) picks only the files that matter. The ZIP also includes a `prompt.txt` describing the task, so the AI tool you paste it into knows what you want.
+
+- **Setup:** you need a free Gemini API key. contextzip walks you through it the first time you use `--prompt`, or you can set the `GEMINI_API_KEY` environment variable.
+- **What is sent:** only the list of file **paths and sizes** that already passed the exclusion rules, plus your prompt. File contents never leave your machine.
+- **Fallback:** if Gemini is rate-limited or unreachable, a local keyword-based selector takes over, so `--prompt` keeps working.
+- **Model:** `gemini-2.5-flash-lite` by default.
+
+### Applying AI changes back
+
+```bash
+contextzip apply-zip              # picks up a ZIP from .contextzip/inbox/
+contextzip apply-zip fix.zip      # or point at one directly
+contextzip apply-zip --dry-run    # preview without writing anything
+```
+
+Every ZIP contextzip creates gets a **local manifest** containing a hash of each file. It's stored next to the ZIP and never inside it, so the AI tool never sees it. When a ZIP comes back, `apply-zip` compares every file against that manifest:
+
+| Status | Meaning | Action |
+|---|---|---|
+| **New** | File didn't exist before | Written |
+| **Modified** | AI changed it, and you haven't touched it locally | Written |
+| **Unchanged** | Identical to what's on disk | Skipped |
+| **Drifted** | *You* edited it locally since zipping | ⚠️ Asks before overwriting |
+| **Untracked** | Exists locally but wasn't in the original ZIP | ⚠️ Asks before overwriting |
+
+`apply-zip` only adds and modifies files. **It never deletes anything.** It also unwraps the extra top-level folder that AI tools and "Download ZIP" buttons often add.
+
+### Terminal error watcher
+
+```bash
+contextzip watch -- npm run dev
+contextzip watch -- python manage.py runserver
+contextzip watch -- python -m pytest --tb=short
+```
+
+contextzip runs your command and watches its output. When a stack trace appears (Python, Django and Node.js/Next.js errors are recognised), it asks whether to package debug context. Press `D` and you get `debug-context.zip` containing:
+
+- `prompt.txt`: an auto-generated description of the problem
+- `terminal-error.txt`: the error output with ANSI codes and noise stripped out
+- `source-files.zip`: the source files named in the stack trace
+
+If you press Ctrl+C before packaging anything, you get one last chance to capture the whole session.
+
+### Visual config UI
+
+```bash
+contextzip config --ui
+```
+
+This opens a local browser tab where you can tick files and folders to always include or exclude, with a live preview of what the ZIP will contain. It saves to `.contextzip/config.json`. The server binds to `127.0.0.1` only, needs a random one-time session token and shuts itself down when you're done.
+
+## Command reference
 
 | Command | What it does |
 |---|---|
-| `contextzip` | Detect stack, exclude noise, package the project |
+| `contextzip` | Detect the stack, exclude noise and package the project |
+| `contextzip include PATH…` | Package **only** these paths |
+| `contextzip exclude PATTERN…` | Package everything **except** these patterns |
 | `contextzip --prompt "task"` | Let Gemini pick only the files relevant to a task |
-| `contextzip --git-changes` | Package only modified/staged/untracked files |
-| `contextzip apply-zip` | Write an AI-returned ZIP back into your project, safely |
-| `contextzip watch -- npm run dev` | Auto-package debug context the moment an error appears |
-| `contextzip config --ui` | Set include/exclude rules visually in a local browser tab |
+| `contextzip --git-changes` | Package only modified, staged and untracked files |
+| `contextzip apply-zip [ZIP]` | Write an AI-returned ZIP back into your project, safely |
+| `contextzip watch -- COMMAND` | Run a command and package debug context when an error appears |
+| `contextzip config …` | Gemini key, workspace location and the visual config UI |
+| `contextzip update` | Check PyPI for a newer release and update in place |
 
-Every command supports `--dry-run`, `--verbose`, `--include`, `--exclude`, and more — see the [full CLI reference](https://contextzip.vercel.app/cli), or the offline version in [`docs/CLI.md`](docs/CLI.md).
+**Run flags** work on `contextzip`, `include` and `exclude`:
 
-contextzip respects your `.gitignore`, detects Node.js, Next.js, Python, Django, FastAPI, Rust, Go, and Ruby (including in monorepos), and never packages secrets — SSH keys, cloud credentials, and Terraform state are always excluded. Details: [contextzip.vercel.app/features](https://contextzip.vercel.app/features).
+| Flag | Short | Description |
+|---|---|---|
+| `--include PATH` | `-i` | Only include files under these paths. Repeatable. |
+| `--exclude PATTERN` | `-e` | Extra exclusion patterns (gitignore syntax). Repeatable. |
+| `--prompt TEXT` | `-p` | Let Gemini select files relevant to this task. |
+| `--git-changes` | | Only include files git reports as changed. |
+| `--dry-run` | `-n` | Show what would be included without creating the ZIP. |
+| `--output FILE` | `-o` | Write the ZIP to this exact path. |
+| `--no-clipboard` | | Don't copy the ZIP to the clipboard. |
+| `--no-gitignore` | | Ignore `.gitignore` and use only the built-in rules. |
+| `--verbose` | `-v` | List every included and excluded file. |
 
-## Also a Python library
+Every command supports `-h` / `--help`, and `contextzip --version` prints the installed version.
 
-```python
-from contextzip import get_git_changes, create_zip
+For every flag of every subcommand (`apply-zip`, `watch`, `config`, `update`), see **[CLI.md](https://github.com/akadeepesh/contextzip/blob/main/CLI.md)** or the [online CLI reference](https://contextzip.vercel.app/cli).
 
-collection = get_git_changes()
-pkg = create_zip(collection, output="/tmp/changes.zip")
+## Configuration
+
+contextzip has two config files, and both are optional.
+
+### Project config: `.contextzip/config.json`
+
+This holds per-project settings. Edit it by hand or with `contextzip config --ui`. Every key is optional:
+
+```jsonc
+{
+  "always_include": ["docs/architecture.md"],  // force-include, even if a rule or .gitignore excludes it
+  "always_exclude": ["*.snap", "fixtures/"],   // a standing --exclude on every run
+  "workspace_location": "git-root",            // "git-root" | "cwd" | "/some/path"
+  "ai": {
+    "enabled": true,
+    "max_files": 10,                           // cap on files the AI may select
+    "prompt_template": "We use pytest, not unittest."  // prepended to every prompt.txt
+  },
+  "limits": {
+    "max_file_size_mb": 1,                     // threshold for "large file" warnings
+    "redact_secrets": false                    // scan included files and mask secret-looking values
+  },
+  "applied_zip_retention": 1,                  // past apply-zip archives to keep
+  "cleanup": { "enabled": true, "keep_recent": 1 },
+  "webui": { "auto_open": true, "port": null }
+}
 ```
 
-Full function reference: [contextzip.vercel.app/cli#python-api](https://contextzip.vercel.app/cli#python-api)
+`.contextzip/` is fully gitignored by default. If your team wants to share these settings, commit the file explicitly with `git add -f .contextzip/config.json`.
 
-## Learn more
+### Personal config
 
-- [Packaging & detection](https://contextzip.vercel.app/features) — frameworks, exclusion rules, safety
-- [AI-powered file selection](https://contextzip.vercel.app/ai-selection) — `--prompt`, Gemini setup
-- [Terminal error watcher](https://contextzip.vercel.app/watch) — `contextzip watch`
-- [Applying changes back](https://contextzip.vercel.app/apply-zip) — `apply-zip`, manifest diffing, safety
-- [Configuration](https://contextzip.vercel.app/configuration) — personal & project config, visual config UI
-- [CLI & Python API reference](https://contextzip.vercel.app/cli)
+Your Gemini API key and personal defaults live outside the project, so they're never committed:
+
+| OS | Location |
+|---|---|
+| Linux / macOS | `~/.config/contextzip/config.json` (or `$XDG_CONFIG_HOME/contextzip/`) |
+| Windows | `%APPDATA%\contextzip\config.json` |
+
+```bash
+contextzip config                          # show the current configuration
+contextzip config --reset-key              # clear the Gemini key and set it up again
+contextzip config --set-workspace cwd      # put .contextzip/ in the current directory
+contextzip config --show-key-path          # print the config file location
+```
+
+The full option-by-option guide is at [contextzip.vercel.app/configuration](https://contextzip.vercel.app/configuration).
+
+## What is always excluded
+
+These patterns apply to **every** project, whatever its stack or `.gitignore` says, and in `--git-changes` mode too:
+
+- **Secrets & credentials:** `.env`, `.env.*`, `*.pem`, `*.key`, `*.p12`, `*.pfx`, `*.jks`, `*.keystore`, `*.ppk`, SSH private keys (`id_rsa`, `id_ed25519`, …), `.npmrc`, `.netrc`, `.pypirc`, `.pgpass`, Docker auth config, `.aws/credentials`, service-account and `*credentials*.json` files, kubeconfigs
+- **Infrastructure state:** `*.tfstate`, `.terraform/`
+- **Version control & editors:** `.git/`, `.svn/`, `.hg/`, `.vscode/`, `.idea/`, swap files, `.DS_Store`
+- **Logs, caches & temp files:** `*.log`, `logs/`, `.cache/`, `tmp/`, `*.tmp`, `*.bak`
+- **Binaries & media:** executables, shared libraries, images, video, audio and archives
+- **Project boilerplate:** `CHANGELOG`, `LICENSE`, `CONTRIBUTING`, `SECURITY.md`, `CODE_OF_CONDUCT.md`, GitHub issue/PR templates
+
+The only way to bring one of these back is to list it explicitly under `always_include` in the project config. CLI flags and `.gitignore` can't override them. For extra safety, set `limits.redact_secrets: true` to mask API keys, tokens, JWTs and private-key blocks that are hardcoded inside files that *do* get included.
+
+> **Tip:** before sharing a sensitive project, run `contextzip --dry-run --verbose` to see exactly what will go into the ZIP.
+
+## Where files go
+
+contextzip keeps everything in a `.contextzip/` folder at your git root (change this with `contextzip config --set-workspace`):
+
+```text
+.contextzip/
+├── output/
+│   ├── codebase/      codebase.zip + manifest + report   (contextzip)
+│   ├── git-changes/   changes.zip + manifest + report    (--git-changes)
+│   ├── prompt/        vibe.zip + manifest + report       (--prompt)
+│   └── watch/         debug-context.zip                  (contextzip watch)
+├── inbox/             drop AI-returned ZIPs here for apply-zip
+└── config.json        project config (optional)
+```
+
+Old outputs are cleaned up automatically, and only the most recent set is kept. You can change this with the `cleanup` setting.
+
+## Python API
+
+contextzip is also a library. The functions behave like the CLI but return plain Python objects and raise exceptions instead of printing.
+
+```python
+from contextzip import get_files, get_git_changes, create_zip, apply_zip, detect_ecosystem
+
+# All project files, filtered by .gitignore and the built-in rules
+collection = get_files(include=["src/"], exclude=["*.log"])
+for path in collection.files:          # plain pathlib.Path objects
+    print(path)
+
+# Only git-changed files, zipped
+changes = get_git_changes()
+pkg = create_zip(changes, output="/tmp/changes.zip")
+print(f"Packed {pkg.file_count} files → {pkg.zip_path}")
+
+# What stack is this?
+print(detect_ecosystem("."))
+```
+
+| Function | Returns |
+|---|---|
+| `get_files(path=None, *, include=None, exclude=None, …)` | `FileCollection` of all project files after filtering |
+| `get_git_changes(path=None, *, use_project_config=True)` | `FileCollection` of staged, modified and untracked files |
+| `create_zip(collection, output=…)` | `PackageResult` with the ZIP path, file count and sizes |
+| `apply_zip(zip_path=None, …)` | `ApplyResult` describing what was written |
+| `detect_ecosystem(path=None)` | Detected ecosystem information |
+
+All exceptions inherit from `ContextzipError`: `NotARepositoryError`, `GitNotFoundError`, `GitCommandError`, `NoFilesError` and `ZipNotFoundError`.
+
+For full signatures, see [contextzip.vercel.app/cli#python-api](https://contextzip.vercel.app/cli#python-api).
+
+## Privacy & security
+
+- **Local by default.** Packaging, `apply-zip`, `watch` and the config UI never make network requests.
+- **Network use is opt-in and limited to two features:**
+  - `--prompt` sends file paths, sizes and your prompt to the Gemini API. File contents are never sent.
+  - `contextzip update` asks PyPI for the latest version number.
+- **No telemetry.** Nothing is collected or phoned home.
+- **Manifests stay local.** `apply-zip` manifests are written next to the ZIP and never inside it.
+
+Found a vulnerability? Please follow [SECURITY.md](https://github.com/akadeepesh/contextzip/blob/main/SECURITY.md) and report it privately rather than in a public issue.
+
+## Platform support
+
+| | Windows | macOS | Linux |
+|---|---|---|---|
+| Packaging, `apply-zip`, config | ✅ | ✅ | ✅ |
+| ZIP copied to clipboard as a file | ✅ native (`CF_HDROP`) | ✅ via Finder | ✅ built-in X11 owner (works under XWayland), or `wl-copy` / `xclip` |
+| `contextzip watch` | ✅ (best in Windows Terminal / VS Code) | ✅ | ✅ |
+
+If the clipboard can't be used, contextzip opens the output folder with the ZIP selected and tells you why. Use `--no-clipboard` to skip this step entirely.
 
 ## Contributing
 
-Contributions are welcome — especially new framework rule sets and edge-case fixes. See [CONTRIBUTING.md](https://github.com/akadeepesh/contextzip/blob/main/CONTRIBUTING.md). Please open an issue before starting a large PR.
+Contributions are welcome, especially **new framework rule sets** and edge-case fixes. To set up a local copy:
+
+```bash
+git clone https://github.com/akadeepesh/contextzip
+cd contextzip
+python -m venv .venv && source .venv/bin/activate   # Windows: .venv\Scripts\activate
+pip install -e .
+contextzip --version
+```
+
+Adding a new language takes three small steps: a `PATTERNS` list in `contextzip/rules/`, one registry entry and one detection rule. [CONTRIBUTING.md](https://github.com/akadeepesh/contextzip/blob/main/CONTRIBUTING.md) walks through it, along with PR conventions. Please open an issue before starting a large PR.
 
 ## License
 
-MIT — see [LICENSE](https://github.com/akadeepesh/contextzip/blob/main/LICENSE) for details.
+[MIT](https://github.com/akadeepesh/contextzip/blob/main/LICENSE) © Deepesh

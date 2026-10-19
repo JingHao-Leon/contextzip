@@ -46,8 +46,22 @@ These flags work on the main command **and** on `include` and `exclude`. Flags g
 | `--no-gitignore` | | Ignore the project's `.gitignore` (use only the built-in rules). |
 | `--git-changes` | | Only include files git reports as modified, added or untracked. The project must be inside a git repository. |
 | `--verbose` | `-v` | Show every included and excluded file. |
+| `--here` | | Only package the folder you're in. Paths in the ZIP stay relative to the project root. |
 
 `--include` and `--exclude` (and the `include` / `exclude` subcommands) also work together with `--git-changes`, and are combined with `always_include` / `always_exclude` from `.contextzip/config.json`.
+
+## Project root
+
+Every command works from the **project root**, wherever you run it from, like git does. Run `cz` inside `frontend/` of a monorepo and the workspace stays at the root (no `frontend/.contextzip/`), the ZIP's paths are root-relative, and `apply-zip` puts files back in the right place.
+
+The root is, first match wins:
+
+1. `CONTEXTZIP_ROOT`, if set.
+2. The **outermost** folder (not above your home folder) that is a git repository (`.git` folder or file) or has a `.contextzip/config.json`. Outermost on purpose: tools like create-next-app run `git init` inside the folder they generate, which leaves a nested `frontend/.git` in your monorepo.
+3. The outermost folder with an existing `.contextzip/` workspace.
+4. The current folder.
+
+Paths you type are relative to where you are, like `git add`: from `frontend/`, `cz include src/` means `frontend/src/`. Add `--here` to package just the current folder. `contextzip config` shows which root was picked and why. `--git-changes` also reads repositories nested inside the root (an embedded `frontend/.git`, or submodules).
 
 ## `contextzip`
 
@@ -99,25 +113,56 @@ Quote patterns that contain `*` so your shell doesn't expand them first.
 Apply an AI-returned ZIP back into your project.
 
 ```bash
-contextzip apply-zip [ZIP] [--manifest PATH] [--dry-run] [--verbose] [--yes]
+contextzip apply-zip [ZIP] [--manifest PATH] [-n] [-v] [--review | --editor | --safe-only | -y]
 ```
 
 | Argument / flag | Short | Description |
 |---|---|---|
 | `ZIP` | | Path to the returned ZIP. Optional: if omitted, contextzip looks in `.contextzip/inbox/`. An explicit path overrides the inbox. |
-| `--manifest PATH` | | Manifest to compare against, instead of auto-detecting the most recent one in `.contextzip/output/`. |
-| `--dry-run` | `-n` | Preview what would change without writing anything. |
-| `--verbose` | `-v` | Show every file and its status, not just the summary. |
-| `--yes` | `-y` | Skip the confirmation prompt, even for risky changes. |
+| `--manifest PATH` | | Snapshot to compare against, instead of the one that best matches the ZIP. |
+| `--dry-run` | `-n` | Show what would change; write nothing. |
+| `--verbose` | `-v` | List every file and what will happen to it. |
+| `--review` | | Decide file by file in a local browser page with side-by-side diffs. |
+| `--editor` | | Resolve files that need a decision in VS Code (or Cursor, Windsurf, VSCodium). |
+| `--safe-only` | | Apply only the safe changes; leave the rest untouched. For scripts and CI. |
+| `--yes` | `-y` | Apply everything without asking. Where you and the AI disagree, the AI's version wins. Never removes files. |
+| `--snapshot ID` | | The snapshot this reply answers (e.g. `14`). Usually found automatically. |
+| `--remove-moved` | | Remove the old copy of files the AI moved (only if you haven't changed them). |
+| `--allow-delete` | | Delete files the AI asked to delete in `CONTEXTZIP.md` (only if you haven't changed them). |
 
 ```bash
-contextzip apply-zip                    # auto-detect from .contextzip/inbox/
-contextzip apply-zip fix.zip            # explicit path
-contextzip apply-zip --dry-run --verbose
-contextzip apply-zip -y                 # no confirmation, even if risky
+contextzip apply-zip                    # from .contextzip/inbox/, asks when something needs a decision
+contextzip apply-zip fix.zip            # a ZIP anywhere on disk
+contextzip apply-zip --dry-run -v       # see exactly what would happen
+contextzip apply-zip --review           # decide in the browser
+contextzip apply-zip --editor           # three-way merge in VS Code
+contextzip apply-zip --safe-only        # CI: only the safe changes
 ```
 
-**How it works.** Every ZIP contextzip creates gets a local manifest — a hash of each included file — written next to it in `.contextzip/output/`. It is never inside the ZIP, so it is never uploaded and never visible to the AI tool. `apply-zip` compares the returned ZIP against that manifest and classifies every file as new, modified, unchanged, or needing a closer look (edited locally since zipping, or no baseline at all) before writing anything. It only adds and modifies files — **nothing is ever deleted**.
+**Where each file goes.** The returned ZIP doesn't need to match your layout. Each file is matched to the project by its longest shared path suffix, so a ZIP wrapped in an extra folder, made relative to a subfolder (`src/...` for `frontend/src/...`), flattened to bare names, or using backslash separators still lands correctly. The layout learned from files that clearly match is applied to brand-new files too. A name that fits several files is settled by content; if it's still unclear the file is marked *ambiguous* and never written on a guess. `__MACOSX/`, `.DS_Store` and contextzip's own `prompt.txt` are ignored.
+
+**What it compares against.** Every ZIP contextzip makes gets a local manifest, never uploaded. `apply-zip` picks the manifest that best matches the returned ZIP, not just the newest, so an unrelated run in between (or `-o`) doesn't confuse it. Each file is then compared three ways: what you sent, what's on disk now, and what came back.
+
+| Status | Meaning | Default |
+|---|---|---|
+| new | The file doesn't exist yet | written |
+| modified | Only the AI changed it | written |
+| merged | You both changed it in different places — three-way merged | written |
+| unchanged | Already matches, including "you already applied this" | skipped |
+| conflict | You both changed the same lines | needs your call |
+| drifted | You changed it and it can't be merged (binary, or the original ZIP is gone) | needs your call |
+| deleted | You deleted it after zipping | needs your call |
+| untracked | Exists here but wasn't in the ZIP you sent | needs your call |
+| partial | The AI returned a cut-down file (`// ... rest unchanged`) | needs your call |
+| ambiguous | Can't tell which file it belongs to | needs your call |
+| moved | The AI moved or renamed it (declared in `CONTEXTZIP.md`, or near-identical content) | new path written; old file kept unless you say so |
+| delete-requested | The AI asked to delete it in `CONTEXTZIP.md` | needs its own yes |
+
+**Snapshots.** The snapshot is found from the `CONTEXTZIP.md` the reply echoes back, or, if it didn't, by matching content against your snapshots. Since every snapshot keeps a copy of what was sent, merging works even if you've packaged again since.
+
+Line endings never count as a change, and text is written back with the local file's line endings and BOM. Secret files that were redacted on the way out are merged against the redacted copy, so your real values are kept and a `[REDACTED]` placeholder is never written over them.
+
+When something needs a decision, `apply-zip` asks: apply the safe changes and leave the rest, review in the browser, resolve in your editor, apply everything, or quit. Without a terminal to ask (CI), it writes nothing unless you pass `--safe-only` or `--yes`. If anything is left undecided, the ZIP stays in the inbox so you can run `apply-zip` again. Only adds and modifies files — **nothing is ever deleted**.
 
 ## `contextzip watch`
 
@@ -174,6 +219,20 @@ contextzip config --ui                      # visually set include/exclude
 
 A workspace location can also be pinned for a whole team by committing `.contextzip/config.json` at the project root, for example `{"workspace_location": "git-root"}`. A project config takes priority over your personal setting.
 
+## `contextzip snapshots`
+
+List this project's snapshots: number, token, mode, file count, age, and whether a reply has been applied.
+
+```bash
+contextzip snapshots
+```
+
+Every package is kept as a numbered snapshot in `.contextzip/snapshots/` (local, never uploaded): a copy of the ZIP plus a manifest of what was sent. Each ZIP's `CONTEXTZIP.md` names its snapshot, e.g. `Snapshot: 14-k3f9a2`. Snapshots are kept while they're among the newest `snapshots.keep` (10), younger than `snapshots.max_age_days` (14), or still awaited by a reply in the inbox.
+
+## `CONTEXTZIP.md`
+
+A short file added to every ZIP for the AI that receives it: the project, the snapshot ID, and how to reply so `apply-zip` can put the answer back cleanly — only changed files, complete contents, the same paths, `[REDACTED]` values left alone, and moves or deletions listed under **Changes** (`moved: a -> b`, `deleted: x`). Turn it off per project with `"zip_guide": false` or in `contextzip config --ui`.
+
 ## `contextzip update`
 
 Check PyPI for a newer release and update in place.
@@ -211,5 +270,6 @@ It detects whether contextzip was installed with pip, pipx or uv tool and re-run
 | `.contextzip/output/watch/` | Debug packages from `contextzip watch` |
 | `.contextzip/inbox/` | Where `apply-zip` looks for a returned ZIP when you don't pass a path |
 | `.contextzip/config.json` | Project config: `always_include`, `always_exclude`, `workspace_location`, `ai`, size limits |
+| `.contextzip/snapshots/` | Numbered snapshots: a copy of each ZIP you sent and its manifest — what `apply-zip` merges against |
 
 Where `.contextzip/` itself lives defaults to the git root; see `contextzip config --set-workspace`.

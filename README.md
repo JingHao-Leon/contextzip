@@ -91,6 +91,7 @@ contextzip --git-changes                    # only what you've changed
 contextzip --prompt "fix the login redirect bug"   # let AI pick the relevant files
 contextzip include src/ app/                # only these folders
 contextzip include src/ .env                # .env too, values redacted
+contextzip --here                           # only the folder you're in (monorepos)
 contextzip exclude tests/ '*.snap'          # everything except these
 contextzip apply-zip                        # write the AI's changes back
 ```
@@ -145,17 +146,25 @@ contextzip apply-zip fix.zip      # or point at one directly
 contextzip apply-zip --dry-run    # preview without writing anything
 ```
 
-Every ZIP contextzip creates gets a **local manifest** containing a hash of each file. It's stored next to the ZIP and never inside it, so the AI tool never sees it. When a ZIP comes back, `apply-zip` compares every file against that manifest:
+AI tools return ZIPs in every shape: wrapped in an extra folder, relative to a subfolder, flattened, with Windows separators. `apply-zip` matches each file to its real place in your project anyway, and new files follow their siblings.
 
-| Status | Meaning | Action |
+Every ZIP contextzip makes gets a **local snapshot** (a hash of each file, never uploaded). `apply-zip` picks the snapshot that best matches the returned ZIP and compares three versions of each file: what you sent, what's on disk now, and what came back.
+
+| Status | Meaning | Default |
 |---|---|---|
-| **New** | File didn't exist before | Written |
-| **Modified** | AI changed it, and you haven't touched it locally | Written |
-| **Unchanged** | Identical to what's on disk | Skipped |
-| **Drifted** | *You* edited it locally since zipping | ⚠️ Asks before overwriting |
-| **Untracked** | Exists locally but wasn't in the original ZIP | ⚠️ Asks before overwriting |
+| **New** / **Modified** | New file, or only the AI changed it | Written |
+| **Merged** | You both changed it, in different places | Written (three-way merge) |
+| **Unchanged** | Already matches — including changes you already applied | Skipped |
+| **Conflict** | You both changed the same lines | Needs your call |
+| **Partial** | The AI returned a cut-down file (`// ... rest unchanged`) | Needs your call |
+| **Moved** | The AI moved or renamed it | Written at the new path; the old file is kept unless you say otherwise |
+| **Drifted** / **Deleted** / **Untracked** / **Ambiguous** / **Delete requested** | Can't be applied safely without you | Needs your call |
 
-`apply-zip` only adds and modifies files. **It never deletes anything.** It also unwraps the extra top-level folder that AI tools and "Download ZIP" buttons often add.
+When something needs a decision you choose: apply the safe changes now, **review side by side in your browser** (`--review`), **resolve in VS Code's merge editor** (`--editor`), or apply everything. Line endings never count as a change, redacted secrets are never overwritten with placeholders, and **files are only removed with your explicit OK** — never one you've changed since.
+
+### Snapshots and CONTEXTZIP.md
+
+Every package is kept locally as a numbered **snapshot** (`#14`), so a reply can be merged against exactly what you sent, even after you've packaged again. Each ZIP also carries a short **`CONTEXTZIP.md`** for the AI: the snapshot ID, and how to reply so the answer applies cleanly (complete files, same paths, secrets left as `[REDACTED]`, moves and deletions listed). When the reply echoes it back, `apply-zip` knows the exact snapshot. `contextzip snapshots` lists them; turn the file off with `"zip_guide": false`.
 
 ### Terminal error watcher
 
@@ -237,6 +246,8 @@ This holds per-project settings. Edit it by hand or with `contextzip config --ui
   },
   "applied_zip_retention": 1,                  // past apply-zip archives to keep
   "cleanup": { "enabled": true, "keep_recent": 1 },
+  "snapshots": { "keep": 10, "max_age_days": 14 },  // history apply-zip merges against
+  "zip_guide": true,                           // add CONTEXTZIP.md to every ZIP
   "webui": { "auto_open": true, "port": null }
 }
 ```
@@ -299,11 +310,12 @@ contextzip keeps everything in a `.contextzip/` folder at your git root (change 
 │   ├── git-changes/   changes.zip + manifest + report    (--git-changes)
 │   ├── prompt/        vibe.zip + manifest + report       (--prompt)
 │   └── watch/         debug-context.zip                  (contextzip watch)
+├── snapshots/         numbered copies of what you sent   (contextzip snapshots)
 ├── inbox/             drop AI-returned ZIPs here for apply-zip
 └── config.json        project config (optional)
 ```
 
-Old outputs are cleaned up automatically, and only the most recent set is kept. You can change this with the `cleanup` setting.
+Old outputs are cleaned up automatically: `output/` keeps the latest ZIP per mode (`cleanup`), and `snapshots/` keeps the newest 10 or anything under 14 days old (`snapshots`) — never one a reply in the inbox is waiting on.
 
 ## Python API
 

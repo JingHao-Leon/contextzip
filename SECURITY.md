@@ -58,8 +58,11 @@ Every run writes a report next to the ZIP listing what was redacted and what was
 
 - **Path handling.** Files outside the project directory are never included, and dangling or looping symlinks are skipped.
 - **Local manifests.** The hashes `apply-zip` uses are stored next to the ZIP on your machine, never inside it.
-- **`apply-zip` never deletes files** and asks before overwriting anything you've changed since the ZIP was made.
+- **`apply-zip` removes files only with your explicit OK** — the old copy of a moved file, or a deletion the AI requested — never one you've changed since the snapshot, and never because of `--yes` alone. It asks before overwriting anything you've changed since the ZIP was made.
+- **Snapshots stay local.** `.contextzip/snapshots/` keeps copies of the ZIPs you sent (already filtered and redacted, exactly as uploaded) so replies can be merged; it's gitignored and pruned automatically.
 - **Config UI.** `contextzip config --ui` binds to `127.0.0.1` only, requires a random one-time session token on every request and shuts itself down after saving or after a period of inactivity.
+- **Review page.** `contextzip apply-zip --review` uses the same model: `127.0.0.1` only, a random session token on every request, no outbound requests, and it shuts down when you apply, cancel or leave it idle. The page only sends your decisions back; the CLI does the writing.
+- **Secrets on the way back.** Files that were redacted when packaged are merged against the redacted copy when an AI returns them, so `apply-zip` never writes a `[REDACTED]` placeholder over a real value. Entries in a returned ZIP that point outside the project (absolute paths, drive letters, `..`) make `apply-zip` refuse the whole ZIP.
 - **API key storage.** Your Gemini key is stored in your personal config (`~/.config/contextzip/config.json`, or `%APPDATA%\contextzip\config.json` on Windows), never in the project. You can provide it with the `GEMINI_API_KEY` environment variable instead.
 
 ## Scope
@@ -69,7 +72,7 @@ In scope:
 - secrets ending up in an archive despite the rules above,
 - path traversal or symlink escapes when packaging or applying a ZIP,
 - `apply-zip` writing outside the project directory,
-- the config UI being reachable or controllable by another process or site,
+- the config UI or review page being reachable or controllable by another process or site,
 - network requests beyond those listed above.
 
 Out of scope: what an AI tool does with an archive after you upload it, and secrets inside files you have chosen to include that the redaction patterns don't recognise. Please still report the second kind if you think a common format should be covered.

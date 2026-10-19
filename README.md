@@ -9,7 +9,7 @@
 [![Downloads](https://static.pepy.tech/badge/contextzip/month)](https://pepy.tech/project/contextzip)
 [![License: MIT](https://img.shields.io/badge/license-MIT-green.svg)](https://github.com/akadeepesh/contextzip/blob/main/LICENSE)
 
-[Documentation](https://contextzip.vercel.app) ·
+[Documentation](https://www.contextzipcli.com) ·
 [CLI reference](https://github.com/akadeepesh/contextzip/blob/main/CLI.md) ·
 [Changelog](https://github.com/akadeepesh/contextzip/blob/main/CHANGELOG.md) ·
 [Report a bug](https://github.com/akadeepesh/contextzip/issues/new/choose)
@@ -220,7 +220,7 @@ This opens a local browser tab where you can tick files and folders to always in
 
 Every command supports `-h` / `--help`, and `contextzip --version` prints the installed version.
 
-For every flag of every subcommand (`apply-zip`, `watch`, `config`, `update`), see **[CLI.md](https://github.com/akadeepesh/contextzip/blob/main/CLI.md)** or the [online CLI reference](https://contextzip.vercel.app/cli).
+For every flag of every subcommand (`apply-zip`, `watch`, `config`, `update`), see **[CLI.md](https://github.com/akadeepesh/contextzip/blob/main/CLI.md)** or the [online CLI reference](https://www.contextzipcli.com/cli).
 
 ## Configuration
 
@@ -270,7 +270,7 @@ contextzip config --set-workspace cwd      # put .contextzip/ in the current dir
 contextzip config --show-key-path          # print the config file location
 ```
 
-The full option-by-option guide is at [contextzip.vercel.app/configuration](https://contextzip.vercel.app/configuration).
+The full option-by-option guide is at [contextzipcli.com/configuration](https://www.contextzipcli.com/configuration).
 
 ## What is always excluded
 
@@ -348,7 +348,7 @@ print(detect_ecosystem("."))
 
 All exceptions inherit from `ContextzipError`: `NotARepositoryError`, `GitNotFoundError`, `GitCommandError`, `NoFilesError` and `ZipNotFoundError`.
 
-For full signatures, see [contextzip.vercel.app/cli#python-api](https://contextzip.vercel.app/cli#python-api).
+For full signatures, see [contextzipcli.com/cli#python-api](https://www.contextzipcli.com/cli#python-api).
 
 ## Privacy & security
 
@@ -374,7 +374,7 @@ If the clipboard can't be used, contextzip opens the output folder with the ZIP 
 
 ## Contributing
 
-Contributions are welcome, especially **new framework rule sets** and edge-case fixes. Not up for writing code? [Request a feature](https://contextzip.vercel.app/request-feature) or [request your language](https://contextzip.vercel.app/request-language). Both turn into GitHub issues ranked by 👍. To set up a local copy:
+Contributions are welcome, especially **new framework rule sets** and edge-case fixes. Not up for writing code? [Request a feature](https://www.contextzipcli.com/request-feature) or [request your language](https://www.contextzipcli.com/request-language). Both turn into GitHub issues ranked by 👍. To set up a local copy:
 
 ```bash
 git clone https://github.com/akadeepesh/contextzip

@@ -114,7 +114,7 @@ A FEW THINGS WORTH KNOWING
     contextzip will put a fresh copy back the next time it touches this
     folder; it never touches an actual pending zip, only this file.
 
-Full docs: https://contextzip.vercel.app/apply-zip
+Full docs: https://www.contextzipcli.com/apply-zip
 """
 
 

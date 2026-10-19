@@ -1069,7 +1069,7 @@ This project uses [Semantic Versioning](https://semver.org/).
 ### Fixed
 - The "Don't see your language?" hint shown for undetected projects linked
   to a placeholder (`https://example.com`). It now points to
-  <https://contextzip.vercel.app/request-language>.
+  <https://www.contextzipcli.com/request-language>.
 - **The report didn't list files that couldn't be written to the ZIP**,
   even though the CLI said "see report". They now appear under "Left out
   of the ZIP" with the reason.

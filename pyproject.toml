@@ -34,7 +34,8 @@ dependencies = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/akadeepesh/contextzip"
+Homepage = "https://www.contextzipcli.com"
+Documentation = "https://www.contextzipcli.com/getting-started"
 Repository = "https://github.com/akadeepesh/contextzip"
 Issues = "https://github.com/akadeepesh/contextzip/issues"
 

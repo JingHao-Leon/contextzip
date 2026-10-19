@@ -103,7 +103,7 @@ def print_detection(detection, *, con: Console = console) -> None:
     if detection.is_unknown:
         ok("Detected", "unknown ecosystem, base rules only", con=con)
         info(
-            "Don't see your language? Request it: https://contextzip.vercel.app/request-language",
+            "Don't see your language? Request it: https://www.contextzipcli.com/request-language",
             con=con,
         )
         return

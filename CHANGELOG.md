@@ -924,6 +924,115 @@ This project uses [Semantic Versioning](https://semver.org/).
 
 ---
 
+## [0.5.0] — 2026-10-19
+
+### Added — versioned snapshots
+- **Every package is a numbered snapshot.** A copy of each ZIP and its
+  manifest is kept in `.contextzip/snapshots/`, so `apply-zip` can merge a
+  reply against exactly what was sent — even after you've packaged again,
+  which used to delete the original. Kept while among the newest
+  `snapshots.keep` (10), younger than `snapshots.max_age_days` (14), or
+  awaited by a reply in the inbox. `-o` ZIPs are snapshotted too.
+- **`CONTEXTZIP.md` in every ZIP**: the snapshot ID plus short reply rules
+  for the AI (complete files, same paths, leave `[REDACTED]` alone, list
+  moves and deletions). A reply that echoes it is matched to its exact
+  snapshot. Turn off with `"zip_guide": false` or in the config UI.
+- **`contextzip snapshots`** lists snapshots; **`apply-zip --snapshot ID`**
+  pins one.
+- **Moves and deletions.** New statuses *moved* (declared in the reply's
+  `CONTEXTZIP.md`, or near-identical content at a new path) and
+  *delete-requested*. The old file is only removed with an explicit yes,
+  `--remove-moved` / `--allow-delete`, or the review page's checkbox —
+  never by `--yes` alone and never if you've changed it since.
+- **Non-git monorepos**: when a folder holds a few sibling repos and no
+  git of its own (`shop/frontend/.git`, `shop/backend/.git`), contextzip
+  asks once whether to use it as the project root and remembers the answer.
+- A notice when you run contextzip inside a git submodule.
+- Monorepo packages declared in npm/yarn/pnpm workspaces, `lerna.json`,
+  Cargo workspaces or `go.work` are detected at any depth.
+- `.gitattributes` normalising line endings to LF.
+
+### Fixed
+- When Gemini is rate-limited, the summary now says the files were picked
+  by keyword match instead of crediting Gemini.
+- The Python API's `create_zip()` now honours the project's
+  `limits.redact_secrets` setting, like the CLI.
+- Moved off pathspec's deprecated `gitwildmatch` factory to
+  `GitIgnoreSpec` (same matching, pinned by tests).
+- **Monorepos: everything now anchors on the project root, from any
+  folder.** Running `cz` inside `frontend/` used to create
+  `frontend/.contextzip/`, write manifests relative to `frontend/`, and
+  skip changes in sibling folders. Now every command — packaging,
+  `--git-changes`, `apply-zip`, `watch` and the config UI — finds the
+  project root first and works from there.
+  - The root is the **outermost** git repository (not above your home
+    folder), so a nested `frontend/.git` left by create-next-app or
+    create-vite no longer hijacks it. A `.git` *file* (worktrees,
+    submodules) now counts as a repo. Without git, an existing
+    `.contextzip/` workspace marks the root. `CONTEXTZIP_ROOT` overrides.
+  - Paths you type are relative to where you are, like `git add`:
+    `cz include src/` from `frontend/` means `frontend/src/`.
+  - `contextzip config` shows which root was picked and why.
+  - An old `.contextzip/` left in a subfolder by earlier versions is
+    pointed out as safe to delete.
+- **`--git-changes` missed changes inside nested repos.** An embedded repo
+  (`frontend/.git`) or submodule appeared as one opaque entry and its
+  changes were dropped. Nested repos are now read too.
+- **`--git-changes` mangled unusual file names.** Names with spaces or
+  non-ASCII characters came back quoted and escaped; git's NUL-separated
+  output is used now.
+- **`watch` from a subfolder** runs your command where you ran it and
+  resolves stack-trace paths against that folder first. Bare file names
+  are matched without walking `node_modules/`.
+- **`apply-zip` could write `[REDACTED]` over real secrets** if the AI
+  returned a redacted file. Redacted files are now always merged against
+  the redacted copy that was sent, keeping your real values.
+
+### Changed
+- **`apply-zip` rebuilt.**
+  - Files are matched to the project by path suffix, so ZIPs wrapped in
+    extra folders, relative to a subfolder, flattened, or using backslash
+    separators land in the right place; new files follow their siblings.
+    Names that fit several files are settled by content, or marked
+    *ambiguous* and never guessed.
+  - The snapshot (manifest) that best matches the returned ZIP is used,
+    not just the newest — no more everything-is-drifted after an unrelated
+    run or a ZIP written with `-o` (those manifests are now registered in
+    `.contextzip/output/external/`).
+  - Three-way merge: when you and the AI changed a file in different
+    places, the changes are merged (status *merged*). Only changes to the
+    same lines are a *conflict*.
+  - A file that already matches what the AI returned is *unchanged*, not
+    drifted. Line endings never count as a change, and text is written
+    with the local file's line endings and BOM.
+  - New statuses: *merged*, *conflict*, *deleted*, *partial* (the AI
+    returned `// ... rest of the file unchanged` instead of code) and
+    *ambiguous*.
+  - When something needs a decision, you choose: apply the safe changes,
+    review in the browser, resolve in your editor, apply everything, or
+    quit. Undecided files are left alone and the ZIP stays in the inbox.
+  - Non-interactive runs (CI) write nothing when a decision is needed,
+    unless `--safe-only` or `--yes` is given.
+  - `__MACOSX/`, `.DS_Store` and echoed `prompt.txt` are ignored.
+- The Python API's `apply_zip()` now leaves files that need a decision
+  alone unless `include_risky=True`. `ApplyResult` gains `skipped` and
+  `zip_kept`.
+- API functions called without a `path` now use the project root, like
+  the CLI.
+
+### Added
+- `--here`: package only the folder you're in.
+- `apply-zip --review`: a local, token-protected review page with
+  side-by-side diffs, word-level highlights and in-page conflict editing.
+- `apply-zip --editor`: resolve conflicts in VS Code's three-way merge
+  editor (also Cursor, Windsurf, VSCodium; or set `CONTEXTZIP_EDITOR`).
+- `apply-zip --safe-only`.
+- `CONTEXTZIP_ROOT` to pin the project root.
+- Manifest format v2: records the ZIP's location, the project root, the
+  redacted files and a line-ending-insensitive hash per text file.
+
+---
+
 ## [0.4.7] — 2026-10-19
 
 ### Changed

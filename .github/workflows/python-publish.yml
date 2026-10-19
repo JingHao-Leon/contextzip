@@ -32,10 +32,14 @@ jobs:
           fi
           echo "Versions match"
 
-  # ── Job 2: Build the distributions ────────────────────────────────────────
+  # ── Job 2: The full test suite must pass on every OS before a release ─────
+  tests:
+    uses: ./.github/workflows/tests.yml
+
+  # ── Job 3: Build the distributions ────────────────────────────────────────
   build:
     runs-on: ubuntu-latest
-    needs: validate
+    needs: [validate, tests]
     steps:
       - uses: actions/checkout@v4
 
@@ -71,7 +75,7 @@ jobs:
           name: release-dists
           path: dist/
 
-  # ── Job 3: Publish to PyPI via Trusted Publishing (no token needed) ────────
+  # ── Job 4: Publish to PyPI via Trusted Publishing (no token needed) ────────
   publish:
     runs-on: ubuntu-latest
     needs: build

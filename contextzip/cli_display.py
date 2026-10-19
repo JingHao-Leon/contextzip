@@ -60,6 +60,44 @@ def info(text: str, *, con: Console = console) -> None:
 # ---------------------------------------------------------------------------
 
 
+def print_root_notice(project_root, *, here: bool = False, packaging: bool = False, con: Console = console) -> None:
+    """
+    One dim line when run from a subfolder, so it's never a surprise that
+    contextzip works from the project root — plus a warning if an older
+    contextzip left a stray workspace in this subfolder.
+    """
+    submodule = getattr(project_root, "submodule", None)
+    if submodule is not None and submodule != project_root.root:
+        try:
+            rel = submodule.relative_to(project_root.root).as_posix()
+        except ValueError:
+            rel = submodule.name
+        info(f"You're in the submodule {rel}/ — working from the whole project; --here covers just the submodule", con=con)
+    if not project_root.in_subdir:
+        return
+    import os
+
+    sub = project_root.subdir
+    up = os.path.relpath(project_root.root, project_root.cwd).replace("\\", "/")
+    if packaging:
+        scope = f"only {sub}/ (--here)" if here else f"the whole project — add --here for just {sub}/"
+        info(f"Working from the project root ({up}) · you're in {sub}/ · packaging {scope}", con=con)
+    else:
+        info(f"Working from the project root ({up}) · you're in {sub}/", con=con)
+
+    stray = project_root.cwd / ".contextzip"
+    if stray.is_dir() and stray.resolve() != (project_root.root / ".contextzip").resolve():
+        from contextzip.packager import _resolve_workspace_location
+
+        location, _ = _resolve_workspace_location(project_root.root)
+        if location != "cwd":
+            warn(
+                f"Found an old workspace at {sub}/.contextzip/ — contextzip now keeps one "
+                f"workspace at {project_root.root.name}/.contextzip/. The old one is safe to delete.",
+                con=con,
+            )
+
+
 def print_detection(detection, *, con: Console = console) -> None:
     """One line: what was detected and how confident contextzip is."""
     if detection.is_unknown:
@@ -228,7 +266,9 @@ def print_file_warnings(
 
 def print_package_result(result, *, con: Console = console) -> None:
     """Where the ZIP landed. (Scan + pack counts are shown by print_scan_and_pack.)"""
-    ok("Saved to", str(result.zip_path), con=con)
+    snapshot = getattr(result, "snapshot", None)
+    detail = f"{result.zip_path}  · snapshot {snapshot_text(snapshot)}" if snapshot else str(result.zip_path)
+    ok("Saved to", detail, con=con)
 
 
 def print_scan_and_pack(
@@ -300,11 +340,14 @@ def print_ai_selection(
     prompt: str,
     *,
     verbose: bool = False,
+    method: str = "gemini",
     con: Console = console,
 ) -> None:
-    """One line: how many files Gemini picked and for what task."""
+    """One line: how many files were picked, by what, and for what task."""
     n = len(selected_paths)
-    ok(f'Gemini selected {n} file{"s" if n != 1 else ""}', f'for "{prompt}"', con=con)
+    files = f'{n} file{"s" if n != 1 else ""}'
+    label = f"Gemini selected {files}" if method == "gemini" else f"Selected {files} by keyword match"
+    ok(label, f'for "{prompt}"', con=con)
     info("prompt.txt will be included in the ZIP", con=con)
 
     if verbose:
@@ -342,10 +385,35 @@ def print_clipboard_result(cb, *, con: Console = console) -> None:
 _APPLY_STATUS_STYLE = {
     "new": ("green", "+"),
     "modified": ("cyan", "~"),
+    "merged": ("cyan", "≈"),
     "unchanged": ("dim", "="),
+    "conflict": ("red", "!"),
     "drifted": ("yellow", "!"),
+    "deleted": ("yellow", "-"),
     "untracked": ("yellow", "?"),
+    "partial": ("yellow", "…"),
+    "ambiguous": ("yellow", "?"),
+    "moved": ("cyan", "→"),
+    "delete-requested": ("yellow", "−"),
 }
+
+_SAFE_ORDER = ("modified", "merged", "moved", "new", "unchanged")
+_RISKY_ORDER = ("conflict", "partial", "drifted", "deleted", "untracked", "ambiguous", "delete-requested")
+
+
+def snapshot_text(label: str | None) -> str:
+    """"14-k3f9a2" -> "#14 (k3f9a2)"."""
+    if not label:
+        return ""
+    number, _, token = label.partition("-")
+    return f"#{number} ({token})" if token else f"#{number}"
+
+
+def _short(path: Path, project_dir: Path) -> str:
+    try:
+        return path.resolve().relative_to(project_dir).as_posix()
+    except ValueError:
+        return str(path)
 
 
 def print_apply_plan(
@@ -355,65 +423,81 @@ def print_apply_plan(
     verbose: bool = False,
     con: Console = console,
 ) -> None:
-    """A handful of one-liners: source zip, manifest, and a status breakdown."""
-    ok("Resolved", str(plan.zip_path), con=con)
+    """Where the zip came from, what it was compared with, and what each file will do."""
+    from collections import Counter
+
+    ok("Resolved", _short(plan.zip_path, project_dir), con=con)
 
     if plan.has_manifest:
-        ok("Diffed against manifest", str(plan.manifest_path), con=con)
+        snapshot = getattr(plan, "snapshot", None)
+        if snapshot:
+            how = "named in the reply's CONTEXTZIP.md" if plan.matched_by_guide else "best match by content"
+            ok(f"Compared with snapshot {snapshot_text(snapshot)}", how, con=con)
+        else:
+            ok("Compared with what you sent", _short(plan.manifest_path, project_dir), con=con)
+        if plan.manifest_note:
+            info(plan.manifest_note, con=con)
     else:
-        warn("No manifest found — every existing path is treated as untracked", con=con)
+        warn("No snapshot of what you sent was found — files that already exist need a look", con=con)
 
-    if plan.wrapper_note:
-        info(plan.wrapper_note, con=con)
+    if plan.rule is not None:
+        info(f"Paths in the zip were remapped: {plan.rule.describe()}", con=con)
+    moved = [e for e in plan.entries if e.moved and e.how in ("suffix", "content")]
+    if moved:
+        info(f"{len(moved)} file{'s' if len(moved) != 1 else ''} matched by name, not exact path — see the list below", con=con)
 
     if plan.structure_warning:
         warn(plan.structure_warning, con=con)
 
-    from collections import Counter
-
     counts = Counter(e.status.value for e in plan.entries)
-    parts = []
-    if counts.get("new"):
-        parts.append(f"{counts['new']} new")
-    if counts.get("modified"):
-        parts.append(f"{counts['modified']} modified")
-    if counts.get("unchanged"):
-        parts.append(f"{counts['unchanged']} unchanged")
-    ok(
-        f"Classified {sum(counts.values())} files",
-        ", ".join(parts) or None,
-        con=con,
-    )
+    parts = [f"{counts[k]} {k}" for k in _SAFE_ORDER if counts.get(k)]
+    ok(f"Classified {len(plan.entries)} files", ", ".join(parts) or None, con=con)
 
-    if counts.get("drifted") or counts.get("untracked"):
-        risky_parts = []
-        if counts.get("drifted"):
-            risky_parts.append(f"{counts['drifted']} drifted")
-        if counts.get("untracked"):
-            risky_parts.append(f"{counts['untracked']} untracked")
-        warn(", ".join(risky_parts) + " — needs a closer look", con=con)
+    risky = [f"{counts[k]} {k}" for k in _RISKY_ORDER if counts.get(k)]
+    if risky:
+        warn(", ".join(risky) + " — needs your call", con=con)
+
+    def line(e) -> None:
+        colour, sym = _APPLY_STATUS_STYLE[e.status.value]
+        extra = []
+        if e.moved and e.how in ("suffix", "content"):
+            extra.append(f"matched {e.source_name} by {'content' if e.how == 'content' else 'name'}")
+        if e.note:
+            extra.append(e.note)
+        tail = f"  [dim]— {'; '.join(extra)}[/]" if extra else ""
+        con.print(f"  [{colour}]{sym}[/] {e.display_path}{tail}")
 
     if verbose:
         for e in plan.entries:
-            colour, sym = _APPLY_STATUS_STYLE[e.status.value]
-            con.print(f"  [{colour}]{sym}[/] {e.rel_path}  [dim]({e.status.value})[/]")
-    elif plan.risky_entries:
-        for e in plan.risky_entries[:10]:
-            colour, sym = _APPLY_STATUS_STYLE[e.status.value]
-            reason = (
-                "changed or removed locally since this zip was made"
-                if e.status.value == "drifted"
-                else "no baseline — wasn't part of the original zip"
-            )
-            con.print(f"  [{colour}]{sym}[/] {e.rel_path}  [dim]— {reason}[/]")
-        if len(plan.risky_entries) > 10:
-            info(f"… and {len(plan.risky_entries) - 10} more — see report", con=con)
+            line(e)
+    else:
+        shown = plan.risky_entries[:12] + [
+            e for e in plan.entries if e.is_safe and (e.moved or e.status.value in ("merged", "moved"))
+        ][:8]
+        for e in shown:
+            line(e)
+        hidden = len(plan.risky_entries) - 12
+        if hidden > 0:
+            info(f"… and {hidden} more — see the report, or use --verbose", con=con)
+
+    if plan.ignored:
+        info(f"Ignored {len(plan.ignored)} entr{'ies' if len(plan.ignored) != 1 else 'y'} (contextzip's own files, OS junk)", con=con)
 
 
 def print_apply_result(result, *, con: Console = console) -> None:
-    """Two lines: what was written and archived."""
-    ok(f"Applied {len(result.written)} files", con=con)
-    ok("Archived zip to", str(result.applied_zip_path), con=con)
+    """What was written, skipped, and where the zip went."""
+    ok(f"Applied {len(result.written)} file{'s' if len(result.written) != 1 else ''}", con=con)
+    removed = getattr(result, "removed", [])
+    if removed:
+        ok(f"Removed {len(removed)} old file{'s' if len(removed) != 1 else ''}", ", ".join(removed[:5]), con=con)
+    for path, reason in getattr(result, "not_removed", [])[:5]:
+        warn(f"Kept {path} — {reason}", con=con)
+    if result.skipped:
+        warn(f"Skipped {len(result.skipped)} for now: {', '.join(result.skipped[:5])}{' …' if len(result.skipped) > 5 else ''}", con=con)
+    if result.zip_kept:
+        info("The zip stays in the inbox — run contextzip apply-zip again once you've decided on the rest.", con=con)
+    else:
+        ok("Archived zip to", str(result.applied_zip_path), con=con)
 
 
 # ---------------------------------------------------------------------------
@@ -430,8 +514,7 @@ def print_auto_cleanup(result, *, con: Console = console) -> None:
     was actually run.
     """
     if result.removed:
-        console_line = f"[dim]🧹 Auto-cleaned {len(result.removed)} old file(s) from .contextzip/ · freed {human_size(result.freed_bytes)}[/]"
-        con.print(console_line)
+        info(f"Cleaned up {len(result.removed)} old item(s) in .contextzip/ · freed {human_size(result.freed_bytes)}", con=con)
 
     if result.failed:
         n = len(result.failed)

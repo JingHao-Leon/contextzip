@@ -187,18 +187,58 @@ def write_apply_report(
     w(f"generated : {_dt.datetime.now().isoformat(timespec='seconds')}")
     w(f"project   : {project_dir}")
     w(f"zip       : {plan.zip_path}")
-    w(f"manifest  : {plan.manifest_path if plan.has_manifest else 'none found'}")
+    snap = getattr(plan, "snapshot", None)
+    if snap:
+        how = "named in the reply's CONTEXTZIP.md" if getattr(plan, "matched_by_guide", False) else "best match by content"
+        w(f"snapshot  : #{snap} ({how})")
+    else:
+        w(f"snapshot  : {plan.manifest_path if plan.has_manifest else 'none found'}")
+    if getattr(plan, "manifest_note", None):
+        w(f"            {plan.manifest_note}")
+    if getattr(plan, "rule", None) is not None:
+        w(f"paths     : remapped {plan.rule.describe()}")
     w("")
 
     w("Files")
     for e in plan.entries:
-        w(f"  {e.rel_path:<60} {e.status.value}")
+        w(f"  {e.display_path:<60} {e.status.value}")
+        if getattr(e, "moved", False):
+            w(f"  {'':<60}   from {e.source_name} ({e.how})")
+        if getattr(e, "moved_from", None) and e.moved_from not in (e.note or ""):
+            w(f"  {'':<60}   moved from {e.moved_from}")
+        if getattr(e, "note", ""):
+            w(f"  {'':<60}   {e.note}")
+        if getattr(e, "candidates", None) and not e.rel_path:
+            w(f"  {'':<60}   could be: {', '.join(e.candidates)}")
     w("")
+
+    if getattr(plan, "ignored", None):
+        w("Ignored entries (contextzip's own files, OS junk)")
+        for name in plan.ignored:
+            w(f"  {name}")
+        w("")
 
     if result is not None:
         w("Result")
         w(f"  written : {len(result.written)}")
-        w(f"  archived: {result.applied_zip_path}")
+        for rel in result.written:
+            w(f"    {rel}")
+        skipped = getattr(result, "skipped", [])
+        if skipped:
+            w(f"  skipped : {len(skipped)}")
+            for rel in skipped:
+                w(f"    {rel}")
+        removed = getattr(result, "removed", [])
+        if removed:
+            w(f"  removed : {len(removed)}")
+            for rel in removed:
+                w(f"    {rel}")
+        for rel, reason in getattr(result, "not_removed", []):
+            w(f"  kept    : {rel} — {reason}")
+        if getattr(result, "zip_kept", False):
+            w(f"  zip     : kept in the inbox — some files still need a decision")
+        else:
+            w(f"  archived: {result.applied_zip_path}")
         w("")
 
     report_path = inbox_dir(project_dir) / (plan.zip_path.stem + ".apply-report.txt")

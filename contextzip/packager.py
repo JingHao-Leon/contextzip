@@ -159,6 +159,9 @@ class PackageResult:
     uncompressed_bytes: int
     compressed_bytes: int
     skipped_in_zip: list[tuple[Path, str]] = field(default_factory=list)
+    snapshot: str | None = None
+    """Printed snapshot ID, e.g. "14-k3f9a2" (see snapshots.py); None if it couldn't be saved."""
+    snapshot_id: int | None = None
     # Files where at least one secret-shaped value was redacted before
     # writing — (path relative to project root, pattern names matched).
     # Empty unless limits.redact_secrets is enabled or a secret file such
@@ -263,6 +266,8 @@ def create_zip_silent(
     mode: str = _DEFAULT_MODE,
     prompt_txt: str | None = None,
     redact_secrets_enabled: bool = False,
+    ecosystem: str | None = None,
+    guide: bool = True,
 ) -> PackageResult:
     """
     Write the included files from *resolve_result* into a ZIP archive
@@ -277,12 +282,14 @@ def create_zip_silent(
     `zip_filename_for_mode`. Ignored when *output_path* is given.
 
     *redact_secrets_enabled* mirrors the project's `limits.redact_secrets`
-    setting — see redact.py.
+    setting — see redact.py. *guide* adds CONTEXTZIP.md (see guide.py);
+    *ecosystem* is shown in it.
     """
     if output_path is not None:
         zip_path = output_path
     else:
         zip_path = _workspace_output_path_silent(project_dir, mode)
+    snapshot = _reserve_snapshot(project_dir)
 
     zip_path.parent.mkdir(parents=True, exist_ok=True)
 
@@ -302,6 +309,7 @@ def create_zip_silent(
     ) as zf:
         if prompt_txt is not None:
             zf.writestr("prompt.txt", prompt_txt.encode("utf-8"))
+        _write_guide(zf, snapshot, project_dir, included, ecosystem, guide)
 
         for abs_path in included:
             if not abs_path.is_file():
@@ -334,7 +342,7 @@ def create_zip_silent(
 
     compressed = zip_path.stat().st_size
 
-    _write_manifest_sidecar(zip_path, project_dir, included)
+    _record_snapshot(snapshot, zip_path, project_dir, included, redacted, skipped_in_zip, mode)
 
     return PackageResult(
         zip_path=zip_path,
@@ -343,6 +351,8 @@ def create_zip_silent(
         compressed_bytes=compressed,
         skipped_in_zip=skipped_in_zip,
         redacted=redacted,
+        snapshot=snapshot.label if snapshot is not None and snapshot.is_complete else None,
+        snapshot_id=snapshot.id if snapshot is not None and snapshot.is_complete else None,
     )
 
 
@@ -354,6 +364,8 @@ def create_zip(
     mode: str = _DEFAULT_MODE,
     prompt_txt: str | None = None,
     redact_secrets_enabled: bool = False,
+    ecosystem: str | None = None,
+    guide: bool = True,
 ) -> PackageResult:
     """
     Write the included files from *resolve_result* into a ZIP archive.
@@ -376,6 +388,9 @@ def create_zip(
     *resolve_result*) to be text and within `limits.max_file_size_mb`;
     binary/oversized files are always written unmodified.
 
+    Every ZIP is also saved as a numbered snapshot (see snapshots.py) and,
+    with *guide*, carries a CONTEXTZIP.md naming it (see guide.py).
+
     Returns a :class:`PackageResult` with compression stats and any
     files that had to be skipped during writing (e.g. permission denied).
     """
@@ -384,6 +399,7 @@ def create_zip(
         zip_path = output_path
     else:
         zip_path = _workspace_output_path(project_dir, mode, console)
+    snapshot = _reserve_snapshot(project_dir)
 
     zip_path.parent.mkdir(parents=True, exist_ok=True)
 
@@ -418,6 +434,7 @@ def create_zip(
             # Write prompt.txt first so it's the first thing AI tools see
             if prompt_txt is not None:
                 zf.writestr("prompt.txt", prompt_txt.encode("utf-8"))
+            _write_guide(zf, snapshot, project_dir, included, ecosystem, guide)
 
             for abs_path in included:
                 if not abs_path.is_file():
@@ -452,7 +469,7 @@ def create_zip(
 
     compressed = zip_path.stat().st_size
 
-    _write_manifest_sidecar(zip_path, project_dir, included)
+    _record_snapshot(snapshot, zip_path, project_dir, included, redacted, skipped_in_zip, mode)
 
     return PackageResult(
         zip_path=zip_path,
@@ -461,41 +478,76 @@ def create_zip(
         compressed_bytes=compressed,
         skipped_in_zip=skipped_in_zip,
         redacted=redacted,
+        snapshot=snapshot.label if snapshot is not None and snapshot.is_complete else None,
+        snapshot_id=snapshot.id if snapshot is not None and snapshot.is_complete else None,
     )
 
 
 # ---------------------------------------------------------------------------
-# Manifest sidecar (local-only — never written into the ZIP itself)
+# Snapshots + CONTEXTZIP.md (local history; the guide is the only part that
+# travels inside the ZIP)
 # ---------------------------------------------------------------------------
 
 
-def _write_manifest_sidecar(
+def _reserve_snapshot(project_dir: Path):
+    """Claim the next snapshot ID before the ZIP is written. None on failure."""
+    from contextzip import snapshots
+
+    try:
+        return snapshots.reserve(project_dir)
+    except OSError:
+        return None
+
+
+def _write_guide(zf, snapshot, project_dir: Path, included: list[Path], ecosystem: str | None, enabled: bool) -> None:
+    """
+    Add CONTEXTZIP.md to the ZIP — unless it's turned off, the snapshot
+    couldn't be reserved, or the project has its own file by that name.
+    """
+    from contextzip.guide import GUIDE_NAME, render
+
+    if not enabled or snapshot is None:
+        return
+    for p in included:
+        try:
+            if p.relative_to(project_dir).as_posix().lower() == GUIDE_NAME.lower():
+                return
+        except ValueError:
+            continue
+    zf.writestr(GUIDE_NAME, render(snapshot=snapshot.label, project=project_dir.name, ecosystem=ecosystem))
+
+
+def _record_snapshot(
+    snapshot,
     zip_path: Path,
     project_dir: Path,
     included: list[Path],
+    redacted: list[tuple[Path, list[str]]] | None,
+    skipped_in_zip: list[tuple[Path, str]] | None,
+    mode: str,
 ) -> None:
     """
-    Write the local manifest for the ZIP just created at *zip_path*.
-
-    This lives next to the archive on disk (e.g. codebase.zip ->
-    codebase.manifest.json) and is never added as a ZIP entry — it must
-    never travel with the archive when it's uploaded to an AI tool.
-    `contextzip apply-zip` reads it later, from this same local location,
-    to classify an AI-returned ZIP's files as new / modified / unchanged
-    without needing any extra metadata inside the returned ZIP.
-
-    Best-effort: failures here (e.g. read-only filesystem) never affect
-    the ZIP creation itself, since apply-zip degrades gracefully when no
-    manifest is found.
+    Save the ZIP and its manifest as a snapshot (see snapshots.py). The
+    manifest is never written into the ZIP, so it never reaches an AI tool.
+    Best-effort: a failure here never affects the ZIP itself; apply-zip
+    just has less to compare against.
     """
-    # Lazy import: applier.py resolves the workspace dir via this module,
-    # so importing it at module load time would be circular.
-    from contextzip.applier import write_manifest
+    from contextzip import snapshots
+    from contextzip.applier import build_manifest
 
+    if snapshot is None:
+        return
     try:
-        write_manifest(zip_path=zip_path, project_dir=project_dir, included=included)
+        manifest = build_manifest(
+            zip_path=zip_path,
+            project_dir=project_dir,
+            included=included,
+            redacted=[rel.as_posix() for rel, _names in redacted or []],
+            skipped={p for p, _reason in skipped_in_zip or []},
+        )
+        snapshots.finalize(snapshot, zip_path, manifest, mode=mode)
     except OSError:
-        pass
+        snapshots.discard(snapshot)
 
 
 # ---------------------------------------------------------------------------
@@ -505,18 +557,13 @@ def _write_manifest_sidecar(
 
 def _find_git_root(start: Path) -> Path | None:
     """
-    Walk up the directory tree from *start* looking for a .git directory.
-    Returns the directory that contains .git, or None if not found.
+    The git repository containing *start*, or None. Delegates to
+    root.find_git_root, which accepts a .git file (worktrees, submodules)
+    as well as a folder and prefers the outermost repo over a nested one.
     """
-    current = start.resolve()
-    while True:
-        if (current / ".git").is_dir():
-            return current
-        parent = current.parent
-        if parent == current:
-            # Reached filesystem root without finding .git
-            return None
-        current = parent
+    from contextzip.root import find_git_root
+
+    return find_git_root(start)
 
 
 def _ensure_workspace_gitignore(workspace: Path) -> None:
@@ -657,14 +704,21 @@ def _workspace_dir(project_dir: Path) -> tuple[Path, bool]:
     - is_git_repo indicates whether a git root was found (used to decide
       whether .gitignore registration applies)
     """
+    from contextzip.root import find_project_root
+
+    project_root = find_project_root(project_dir)
     git_root = _find_git_root(project_dir)
     location, _source = _resolve_workspace_location(project_dir)
-    anchor = git_root if git_root is not None else project_dir
+    # The project root, not merely the git root: outside git it's still the
+    # folder that already holds this project's workspace, so running from a
+    # subfolder never scatters a second .contextzip/ there.
+    anchor = project_root.root
 
     if location == "git-root":
         workspace = anchor / ".contextzip"
     elif location == "cwd":
-        workspace = project_dir / ".contextzip"
+        # An explicit opt-in to a workspace per folder you run from.
+        workspace = Path.cwd().resolve() / ".contextzip"
     else:
         custom = Path(location).expanduser()
         base = custom if custom.is_absolute() else (anchor / custom)

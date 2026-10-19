@@ -5,6 +5,7 @@ cli.py — contextzip entry point and command routing.
 from __future__ import annotations
 
 import os
+import time
 from pathlib import Path
 
 import click
@@ -56,11 +57,11 @@ from contextzip.cli_display import (
     print_apply_result,
     print_auto_cleanup,
     print_redaction_summary,
+    print_root_notice,
 )
 from contextzip.report import write_scan_report, write_apply_report
 from contextzip.applier import (
     ApplyError,
-    MultipleZipsFoundError,
     build_plan,
     discard_plan,
     execute_plan,
@@ -75,6 +76,8 @@ from contextzip.cli_ai import (
 from contextzip.cli_onboard import onboard_api_key
 from contextzip import cleanup as cleanup_mod
 from contextzip import updater as updater_mod
+from contextzip import root as root_mod
+from contextzip.root import ROOT_KIND_LABELS, find_project_root, to_root_relative
 
 console = Console()
 
@@ -148,6 +151,15 @@ def _modifier_options(f):
             default=False,
             help="Show every included and excluded file.",
         ),
+        click.option(
+            "--here",
+            is_flag=True,
+            default=False,
+            help=(
+                "Only package the folder you're in. contextzip always works from "
+                "the project root; paths in the ZIP stay relative to it."
+            ),
+        ),
     ]
     for dec in reversed(decorators):
         f = dec(f)
@@ -197,6 +209,7 @@ def main(
     no_gitignore: bool,
     git_changes: bool,
     verbose: bool,
+    here: bool,
 ) -> None:
     """
     \b
@@ -226,6 +239,7 @@ def main(
         no_gitignore=no_gitignore,
         git_changes=git_changes,
         verbose=verbose,
+        here=here,
     )
 
 
@@ -246,6 +260,7 @@ def cmd_exclude(
     no_gitignore: bool,
     git_changes: bool,
     verbose: bool,
+    here: bool,
 ) -> None:
     """
     Exclude specific files or patterns and package everything else.
@@ -270,6 +285,7 @@ def cmd_exclude(
         no_gitignore=no_gitignore,
         git_changes=git_changes,
         verbose=verbose,
+        here=here,
     )
 
 
@@ -290,6 +306,7 @@ def cmd_include(
     no_gitignore: bool,
     git_changes: bool,
     verbose: bool,
+    here: bool,
 ) -> None:
     """
     Package only the specified paths and skip everything else.
@@ -313,6 +330,7 @@ def cmd_include(
         no_gitignore=no_gitignore,
         git_changes=git_changes,
         verbose=verbose,
+        here=here,
     )
 
 
@@ -324,41 +342,79 @@ def cmd_include(
 @main.command("apply-zip")
 @click.argument("zip_path", required=False, metavar="[ZIP]")
 @click.option(
-    "--manifest",
-    "manifest_path",
+    "--snapshot",
+    "snapshot_ref",
     default=None,
-    metavar="PATH",
+    metavar="ID",
     help=(
-        "Manifest to diff against, instead of auto-detecting the most "
-        "recently created one in .contextzip/output/."
+        "Snapshot this reply answers (e.g. 14). Usually found automatically "
+        "from the CONTEXTZIP.md in the reply, or by content."
     ),
+)
+@click.option("--manifest", "manifest_path", default=None, metavar="PATH", hidden=True)
+@click.option(
+    "--remove-moved",
+    is_flag=True,
+    default=False,
+    help="When the AI moved or renamed a file, remove the old copy (only if you haven't changed it).",
+)
+@click.option(
+    "--allow-delete",
+    is_flag=True,
+    default=False,
+    help="Delete files the AI asked to delete (only if you haven't changed them).",
 )
 @click.option(
     "--dry-run",
     "-n",
     is_flag=True,
     default=False,
-    help="Preview what would change without writing anything.",
+    help="Show what would change without writing anything.",
 )
 @click.option(
     "--verbose",
     "-v",
     is_flag=True,
     default=False,
-    help="Show every file and its status, not just the summary.",
+    help="List every file and what will happen to it.",
+)
+@click.option(
+    "--review",
+    is_flag=True,
+    default=False,
+    help="Decide file by file in a local browser page with side-by-side diffs.",
+)
+@click.option(
+    "--editor",
+    "use_editor",
+    is_flag=True,
+    default=False,
+    help="Resolve files that need a decision in VS Code (or Cursor, Windsurf, VSCodium).",
+)
+@click.option(
+    "--safe-only",
+    is_flag=True,
+    default=False,
+    help="Apply only the safe changes; leave files that need a decision untouched.",
 )
 @click.option(
     "--yes",
     "-y",
     is_flag=True,
     default=False,
-    help="Skip the confirmation prompt, even for risky changes.",
+    help="Apply everything without asking. Where you and the AI disagree, the AI's version wins.",
 )
 def cmd_apply_zip(
     zip_path: str | None,
+    snapshot_ref: str | None,
     manifest_path: str | None,
+    remove_moved: bool,
+    allow_delete: bool,
     dry_run: bool,
     verbose: bool,
+    review: bool,
+    use_editor: bool,
+    safe_only: bool,
     yes: bool,
 ) -> None:
     """
@@ -366,42 +422,67 @@ def cmd_apply_zip(
 
     \b
     EXAMPLES
-      contextzip apply-zip                  # auto-detect from .contextzip/inbox/
-      contextzip apply-zip fix.zip          # explicit path overrides the inbox
-      contextzip apply-zip --dry-run --verbose
-      contextzip apply-zip -y               # skip confirmation, even if risky
+      contextzip apply-zip                  # picks up the zip in .contextzip/inbox/
+      contextzip apply-zip fix.zip          # or one anywhere on disk
+      contextzip apply-zip --dry-run -v     # see exactly what would happen
+      contextzip apply-zip --review         # decide file by file in the browser
+      contextzip apply-zip --editor         # resolve conflicts in VS Code
+      contextzip apply-zip --safe-only      # scripts/CI: only the safe changes
 
     \b
     HOW IT WORKS
-      Every zip contextzip creates gets a local manifest — a hash of each
-      included file — written next to it in .contextzip/output/. Never
-      inside the zip itself, so it's never uploaded and never visible to
-      whatever AI tool the zip is pasted into.
+      Each file in the zip is matched to its place in the project — even if
+      the AI wrapped it in a folder, made paths relative to a subfolder or
+      flattened them. It's then compared with what you sent (a local snapshot
+      that never leaves your machine) and with the file on disk now:
 
-      apply-zip diffs the returned zip against that manifest to classify
-      every file as new, modified, unchanged, or one needing a closer look
-      (edited locally since zipping, or with no baseline at all) before
-      writing anything. Only adds and modifies files — nothing is ever
-      deleted.
+    \b
+        new, modified        written
+        merged               you both changed it in different places — merged
+        unchanged            already matches — skipped
+        conflict             you both changed the same lines
+        drifted / deleted    you changed or deleted it and it can't be merged
+        untracked            exists, but wasn't in the zip you sent
+        partial              the AI returned a cut-down file ("... rest unchanged")
+        ambiguous            can't tell which file it belongs to
+        moved                the AI moved/renamed it — new path written, old kept
+        delete-requested     the AI asked to delete it in CONTEXTZIP.md
+
+      Conflicts and the groups after them are never written without your
+      say-so. Files are only removed with an explicit yes (or --remove-moved
+      / --allow-delete), and never one you've changed since the snapshot.
     """
-    project_dir = Path(os.getcwd()).resolve()
+    project_root = _resolve_root()
+    project_dir = project_root.root
     project_cfg = load_project_config(project_dir)
 
     console.print()
+    print_root_notice(project_root)
 
     try:
         resolved_zip = find_zip_to_apply(project_dir, zip_path)
-    except MultipleZipsFoundError as exc:
-        err(str(exc))
-        raise SystemExit(1)
     except ApplyError as exc:
         err(str(exc))
         raise SystemExit(1)
 
-    manifest = find_latest_manifest(project_dir, manifest_path)
+    explicit_manifest = None
+    if snapshot_ref is not None:
+        from contextzip.snapshots import find as find_snapshot
+
+        snap = find_snapshot(project_dir, snapshot_ref)
+        if snap is None:
+            err(f"No snapshot {snapshot_ref} here — see contextzip snapshots")
+            raise SystemExit(1)
+        explicit_manifest = snap.manifest_path
+    elif manifest_path is not None:
+        explicit_manifest = find_latest_manifest(project_dir, manifest_path)
+        if explicit_manifest is None:
+            err(f"No such manifest: {manifest_path}")
+            raise SystemExit(1)
 
     try:
-        plan = build_plan(resolved_zip, project_dir, manifest)
+        with console.status("[cyan]Matching files and comparing versions…[/]", spinner="dots"):
+            plan = build_plan(resolved_zip, project_dir, explicit_manifest)
     except ApplyError as exc:
         err(str(exc))
         raise SystemExit(1)
@@ -412,6 +493,7 @@ def cmd_apply_zip(
     if not plan.writable_entries:
         info("Nothing to apply — every file already matches the project.")
         discard_plan(plan)
+        _archive_if_inbox(plan, project_dir, project_cfg)
         return
 
     if dry_run:
@@ -420,25 +502,204 @@ def cmd_apply_zip(
         discard_plan(plan)
         return
 
-    if plan.is_risky and not yes:
-        prompt = (
-            "  This zip's structure doesn't look right — apply anyway?"
-            if plan.structure_warning
-            else "  Some files above need a closer look — apply anyway?"
-        )
-        proceed = click.confirm(prompt, default=False)
-        if not proceed:
-            info("Cancelled — no files written.")
+    decisions: dict | None = None
+    include_risky = False
+    mode = None
+
+    if plan.is_risky:
+        mode = _apply_mode(plan, review=review, use_editor=use_editor, safe_only=safe_only, yes=yes)
+    elif review:
+        mode = "review"
+
+    if mode == "quit":
+        info("Cancelled — no files written.")
+        discard_plan(plan)
+        return
+    if mode == "all":
+        include_risky = True
+    elif mode == "review":
+        from contextzip.webui.review import review_in_browser
+
+        console.print()
+        decisions = review_in_browser(plan, project_dir, con=console)
+        if decisions is None:
+            info("Review closed without applying — no files written.")
+            discard_plan(plan)
+            return
+    elif mode == "editor":
+        decisions = _resolve_in_editor(plan, project_dir)
+        if decisions is None:
+            info("Nothing applied.")
             discard_plan(plan)
             return
 
-    result = execute_plan(plan, project_dir, retain=project_cfg.applied_zip_retention)
+    if mode != "review":
+        remove_moved, allow_delete = _removal_consent(plan, remove_moved=remove_moved, allow_delete=allow_delete)
+
+    result = execute_plan(
+        plan,
+        project_dir,
+        retain=project_cfg.applied_zip_retention,
+        decisions=decisions,
+        include_risky=include_risky,
+        remove_moved=remove_moved,
+        allow_delete=allow_delete,
+    )
+    console.print()
     print_apply_result(result)
     report_path = write_apply_report(project_dir=project_dir, plan=plan, result=result)
     print_report_hint(report_path)
 
     # ── Auto-cleanup ─────────────────────────────────────────────────────────
     _auto_cleanup(project_dir, project_cfg)
+
+
+def _resolve_root():
+    """
+    Find the project root (see root.py) — and, the first time a folder looks
+    like a monorepo without git at the top, ask whether to use it. A yes
+    writes .contextzip/config.json there, which makes it the root from then
+    on; a no is remembered so the question never comes back.
+    """
+    import sys
+
+    project_root = find_project_root()
+    suggested = project_root.suggested_root
+    if suggested is None or not (sys.stdin.isatty() and sys.stdout.isatty()):
+        return project_root
+
+    projects = sorted(
+        c.name for c in suggested.iterdir()
+        if c.is_dir() and not c.name.startswith(".") and root_mod._is_project(c)
+    )
+    console.print()
+    names = ", ".join(f"{n}/" for n in projects)
+    info(f"{names} look like parts of one project in {suggested.name}/.")
+    use_it = click.confirm(f"  Use {suggested.name}/ as the project root?", default=True)
+    if use_it:
+        from contextzip.packager import _ensure_workspace_gitignore
+
+        workspace = suggested / ".contextzip"
+        workspace.mkdir(parents=True, exist_ok=True)
+        config_file = workspace / "config.json"
+        if not config_file.exists():
+            config_file.write_text("{}\n", encoding="utf-8")
+        try:
+            _ensure_workspace_gitignore(workspace)
+        except OSError:
+            pass
+        ok(f"Project root set to {suggested}", "saved in .contextzip/config.json")
+        return find_project_root()
+
+    from contextzip.config import save_declined_root
+
+    try:
+        save_declined_root(str(suggested))
+    except OSError:
+        pass
+    info("Got it — contextzip won't ask about this folder again.")
+    return project_root
+
+
+def _removal_consent(plan, *, remove_moved: bool, allow_delete: bool) -> tuple[bool, bool]:
+    """
+    Removing files is never implied — not even by --yes. Ask about moved
+    files' old copies and requested deletions separately, when there's
+    someone to ask and no flag already answered.
+    """
+    import sys
+
+    interactive = sys.stdin.isatty() and sys.stdout.isatty()
+    moves = plan.moves
+    if moves and not remove_moved and interactive:
+        console.print()
+        console.print(f"  The AI moved {len(moves)} file{'s' if len(moves) != 1 else ''}:")
+        for e in moves[:10]:
+            console.print(f"    [cyan]→[/] {e.moved_from}  [dim]→[/]  {e.rel_path}")
+        remove_moved = click.confirm("  Remove the old file(s)?", default=False)
+
+    deletions = [e for e in plan.deletions if e.removable]
+    if deletions and not allow_delete and interactive:
+        console.print()
+        console.print(f"  The AI asked to delete {len(deletions)} file{'s' if len(deletions) != 1 else ''}:")
+        for e in deletions[:10]:
+            console.print(f"    [yellow]−[/] {e.rel_path}")
+        allow_delete = click.confirm("  Delete them?", default=False)
+    return remove_moved, allow_delete
+
+
+def _archive_if_inbox(plan, project_dir: Path, project_cfg) -> None:
+    """A zip with nothing left to apply is done — move it out of the inbox."""
+    from contextzip.applier import _move_zip_to_applied, _workspace_dir as _ws
+
+    try:
+        dest = _move_zip_to_applied(plan.zip_path, project_dir, _ws(project_dir), retain=project_cfg.applied_zip_retention)
+    except OSError:
+        return
+    if dest != plan.zip_path:
+        ok("Archived zip to", str(dest))
+
+
+def _apply_mode(plan, *, review: bool, use_editor: bool, safe_only: bool, yes: bool) -> str:
+    """How to handle files that need a decision: review | editor | safe | all | quit."""
+    if review:
+        return "review"
+    if use_editor:
+        return "editor"
+    if safe_only:
+        return "safe"
+    if yes:
+        return "all"
+
+    import sys
+
+    if not (sys.stdin.isatty() and sys.stdout.isatty()):
+        err("Some files need a decision, and there's no one here to ask.")
+        info("Re-run with --safe-only to apply just the safe changes, or --yes to apply everything.")
+        discard_plan(plan)
+        raise SystemExit(1)
+
+    from contextzip.editor import editor_name, find_editor
+
+    safe = len(plan.safe_entries)
+    risky = len(plan.risky_entries)
+    editor = find_editor()
+    them = "them" if risky != 1 else "it"
+
+    console.print()
+    console.print("  [bold]What now?[/]")
+    if safe:
+        console.print(f"    [bold cyan]S[/]  apply the {safe} safe change{'s' if safe != 1 else ''}, leave {them} for later")
+    else:
+        console.print(f"    [bold cyan]S[/]  leave {them} for later")
+    console.print(f"    [bold cyan]R[/]  review {them} in your browser, side by side")
+    if editor:
+        console.print(f"    [bold cyan]E[/]  resolve {them} in {editor_name(editor)}")
+    console.print("    [bold cyan]A[/]  apply everything — the AI's version wins")
+    console.print("    [bold cyan]Q[/]  quit without writing")
+    keys = ["s", "r", "a", "q"] + (["e"] if editor else [])
+    choice = click.prompt("  Choose", type=click.Choice(keys, case_sensitive=False), default="s", show_choices=False)
+    return {"s": "safe", "r": "review", "e": "editor", "a": "all", "q": "quit"}[choice.lower()]
+
+
+def _resolve_in_editor(plan, project_dir: Path) -> dict | None:
+    from contextzip.editor import editor_name, find_editor, resolve_in_editor
+
+    editor = find_editor()
+    if editor is None:
+        warn("No editor found (looked for code, cursor, windsurf, codium) — opening the browser review instead.")
+        info("Set CONTEXTZIP_EDITOR to use another editor.")
+        from contextzip.webui.review import review_in_browser
+
+        return review_in_browser(plan, project_dir, con=console)
+
+    info(f"Opening {len(plan.risky_entries)} file(s) in {editor_name(editor)} — close each tab when you're done.")
+
+    def ask(entry) -> str:
+        take = click.confirm(f"  {entry.display_path}: take the AI's version?", default=False)
+        return "theirs" if take else "keep"
+
+    return resolve_in_editor(plan, project_dir, ask)
 
 
 # ---------------------------------------------------------------------------
@@ -485,7 +746,8 @@ def cmd_watch(command: tuple[str, ...]) -> None:
         correct behaviour, run it directly and use 'contextzip capture'
         as a companion command in a second terminal.
     """
-    project_dir = Path(os.getcwd()).resolve()
+    project_root = _resolve_root()
+    project_dir = project_root.root
 
     cmd_list = list(command)
     if cmd_list and cmd_list[0] == "--":
@@ -507,9 +769,12 @@ def cmd_watch(command: tuple[str, ...]) -> None:
 
     from contextzip.watcher import run_watch
 
+    print_root_notice(project_root)
+
     exit_code = run_watch(
         command=cmd_list,
         project_dir=project_dir,
+        run_dir=project_root.cwd,
         ecosystems=detection.ecosystems,
         ecosystem_display=detection.display_name,
         console=console,
@@ -583,7 +848,7 @@ def cmd_config(
         from contextzip.detector import detect as _detect
         from contextzip.webui.server import launch_config_ui
 
-        project_dir = Path(os.getcwd()).resolve()
+        project_dir = _resolve_root().root
         with console.status("[cyan]Detecting project ecosystem…[/]", spinner="dots"):
             detection = _detect(project_dir)
         launch_config_ui(project_dir, detection, con=console)
@@ -652,9 +917,13 @@ def cmd_config(
         project_config_path,
     )
 
-    cwd = Path(os.getcwd()).resolve()
+    project_root = _resolve_root()
+    cwd = project_root.root
+    ok(f"Project root: {cwd}", ROOT_KIND_LABELS.get(project_root.kind, project_root.kind))
     ws_location, ws_source = _resolve_workspace_location(cwd)
-    ok(f"Workspace: {ws_location}", ws_source)
+    from contextzip.packager import _workspace_dir as _ws_dir
+
+    ok(f"Workspace: {_ws_dir(cwd)[0]}", f"{ws_location} · {ws_source}")
 
     project_cfg = load_project_config(cwd)
     if has_legacy_project_config(cwd):
@@ -691,6 +960,64 @@ def cmd_config(
 # ---------------------------------------------------------------------------
 # Subcommand: update
 # ---------------------------------------------------------------------------
+
+
+@main.command("snapshots")
+def cmd_snapshots() -> None:
+    """
+    List this project's snapshots.
+
+    \b
+    Every package contextzip makes is kept as a numbered snapshot, so
+    apply-zip can merge an AI reply against exactly what you sent — even
+    after you've packaged again. The CONTEXTZIP.md inside each ZIP names
+    its snapshot, so a reply that echoes it back is matched exactly.
+
+    \b
+    Snapshots stay on your machine and are pruned automatically: each is
+    kept while it's among the newest `snapshots.keep` (default 10), younger
+    than `snapshots.max_age_days` (default 14), or still awaited by a reply
+    in the inbox.
+    """
+    from contextzip import snapshots as snaps
+
+    project_root = _resolve_root()
+    project_dir = project_root.root
+    console.print()
+    print_root_notice(project_root)
+
+    found = snaps.list_snapshots(project_dir)
+    if not found:
+        info("No snapshots yet — run contextzip to make one.")
+        console.print()
+        return
+
+    cfg = load_project_config(project_dir)
+    ok(
+        f"{len(found)} snapshot{'s' if len(found) != 1 else ''}",
+        f"kept while among the newest {cfg.snapshots.keep} or younger than {cfg.snapshots.max_age_days} days",
+    )
+    now = time.time()
+    for s in found:
+        data = s.load()
+        files = len(data.get("files", {}))
+        status = data.get("status", "pending")
+        mode = {"standard": "codebase", "git-changes": "changes", "prompt": "prompt"}.get(data.get("mode", ""), data.get("mode", "?"))
+        age = _ago(now - snaps.created_ts(s))
+        colour = "green" if status == "applied" else "dim"
+        console.print(
+            f"  [bold]#{s.id:<4}[/] [dim]{s.token}[/]  {mode:<9} {files:>5} files  {age:>12}   [{colour}]{status}[/]"
+        )
+    console.print()
+
+
+def _ago(seconds: float) -> str:
+    seconds = max(0, int(seconds))
+    for unit, size in (("day", 86400), ("hour", 3600), ("minute", 60)):
+        if seconds >= size:
+            n = seconds // size
+            return f"{n} {unit}{'s' if n != 1 else ''} ago"
+    return "just now"
 
 
 @main.command("update")
@@ -877,6 +1204,8 @@ def _auto_cleanup(project_dir: Path, project_cfg) -> None:
             project_dir,
             keep_recent=project_cfg.cleanup.keep_recent,
             applied_zip_retention=project_cfg.applied_zip_retention,
+            snapshots_keep=project_cfg.snapshots.keep,
+            snapshots_max_age_days=project_cfg.snapshots.max_age_days,
         )
         if plan.is_empty:
             return
@@ -897,14 +1226,26 @@ def _run(
     no_gitignore: bool,
     git_changes: bool,
     verbose: bool,
+    here: bool = False,
 ) -> None:
     """
     All packaging work lives here. The main command and every subcommand
     delegate to this function after collecting their arguments/flags,
     keeping the CLI surface thin and the logic testable in isolation.
     """
-    project_dir = Path(os.getcwd()).resolve()
+    project_root = _resolve_root()
+    project_dir = project_root.root
     console.print()
+
+    # Paths typed on the command line are relative to where you are — like
+    # git add — so translate them to the project root before anything else.
+    if include_only:
+        include_only = to_root_relative(include_only, project_root)
+    if extra_exclude:
+        extra_exclude = to_root_relative(extra_exclude, project_root, patterns=True)
+    if here and project_root.in_subdir:
+        include_only = [*(include_only or []), project_root.subdir]
+    print_root_notice(project_root, here=here, packaging=True)
 
     # ── Project config (.contextzip/config.json) ────────────────────────────
     project_cfg = load_project_config(project_dir)
@@ -1083,6 +1424,8 @@ def _run(
             mode=run_mode,
             prompt_txt=prompt_txt,
             redact_secrets_enabled=project_cfg.limits.redact_secrets,
+            ecosystem=detection.display_name,
+            guide=project_cfg.zip_guide,
         )
     except Exception as exc:
         err(f"Failed to create ZIP: {exc}")

@@ -534,6 +534,10 @@ INDEX_HTML = r"""<!DOCTYPE html>
             <div class="fc"><div class="toggle" id="redact-toggle"><div class="knob"></div></div></div>
           </div>
           <div class="field">
+            <div class="fl"><div class="ft">Add CONTEXTZIP.md to every ZIP</div><div class="fd">A short note for the AI: which snapshot this is, and how to reply so apply-zip can put the changes back cleanly.</div></div>
+            <div class="fc"><div class="toggle" id="guide-toggle"><div class="knob"></div></div></div>
+          </div>
+          <div class="field">
             <div class="fl"><div class="ft">Keep applied zips</div><div class="fd">How many past apply-zip archives to retain in .contextzip/inbox/applied/ before pruning.</div></div>
             <div class="fc stepper" id="retention-stepper">
               <button type="button" data-step="-1">−</button><span class="val" id="retention-val">1</span><button type="button" data-step="1">+</button>
@@ -606,7 +610,8 @@ INDEX_HTML = r"""<!DOCTYPE html>
       ai: { enabled: true, provider: "gemini", max_files: 10, prompt_template: "" },
       limits: { max_file_size_mb: 1, redact_secrets: false },
       applied_zip_retention: 1,
-      webui: { auto_open: true, port: null }
+      webui: { auto_open: true, port: null },
+      zip_guide: true
     }
   };
 
@@ -794,7 +799,8 @@ INDEX_HTML = r"""<!DOCTYPE html>
       ai: state.cfg.ai,
       limits: state.cfg.limits,
       applied_zip_retention: state.cfg.applied_zip_retention,
-      webui: state.cfg.webui
+      webui: state.cfg.webui,
+      zip_guide: state.cfg.zip_guide !== false
     };
   }
 
@@ -936,6 +942,7 @@ INDEX_HTML = r"""<!DOCTYPE html>
     // Advanced
     document.getElementById("max-size-val").textContent = cfg.limits.max_file_size_mb.toFixed(1) + " MB";
     document.getElementById("redact-toggle").classList.toggle("on", !!cfg.limits.redact_secrets);
+    document.getElementById("guide-toggle").classList.toggle("on", cfg.zip_guide !== false);
     document.getElementById("retention-val").textContent = cfg.applied_zip_retention;
     document.getElementById("autoopen-toggle").classList.toggle("on", !!cfg.webui.auto_open);
     document.getElementById("port-input").value = cfg.webui.port === null || cfg.webui.port === undefined ? "" : cfg.webui.port;
@@ -1020,6 +1027,13 @@ INDEX_HTML = r"""<!DOCTYPE html>
       markDirty();
     });
 
+    // CONTEXTZIP.md toggle
+    document.getElementById("guide-toggle").addEventListener("click", function () {
+      state.cfg.zip_guide = state.cfg.zip_guide === false;
+      this.classList.toggle("on", state.cfg.zip_guide);
+      markDirty();
+    });
+
     // Retention stepper
     document.getElementById("retention-stepper").addEventListener("click", function (e) {
       var btn = e.target.closest("button[data-step]");
@@ -1067,6 +1081,7 @@ INDEX_HTML = r"""<!DOCTYPE html>
       state.cfg.limits = Object.assign({}, state.cfg.limits, data.config.limits);
       state.cfg.applied_zip_retention = data.config.applied_zip_retention;
       state.cfg.webui = Object.assign({}, state.cfg.webui, data.config.webui);
+      state.cfg.zip_guide = data.config.zip_guide !== false;
       applyPayload(data);
       renderConfigTabs();
     }).catch(function (err) {

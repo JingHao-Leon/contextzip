@@ -57,8 +57,7 @@ import re
 from dataclasses import dataclass
 from pathlib import PurePath
 
-import pathspec
-
+from contextzip.filters import make_spec
 from contextzip.rules.base import SECRET_PATTERNS
 
 REDACTED = "[REDACTED]"
@@ -201,7 +200,7 @@ def redact_secrets(text: str) -> tuple[str, list[str]]:
 # Secret files the user deliberately included (see module docstring)
 # ---------------------------------------------------------------------------
 
-_SECRET_SPEC = pathspec.PathSpec.from_lines("gitwildmatch", SECRET_PATTERNS)
+_SECRET_SPEC = make_spec(SECRET_PATTERNS)
 
 # KEY=value, optionally prefixed with `export` — the dotenv assignment form.
 _ENV_ASSIGNMENT = re.compile(r"^(\s*(?:export\s+)?[A-Za-z_][A-Za-z0-9_.\-]*\s*=[ \t]*)(.*)$")

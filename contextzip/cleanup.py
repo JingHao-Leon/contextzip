@@ -66,7 +66,7 @@ _APPLIED_DIRNAME = "applied"
 @dataclass
 class CleanupItem:
     path: Path
-    kind: str  # "zip-set" | "applied-zip" | "apply-report" | "legacy-backups"
+    kind: str  # "zip-set" | "applied-zip" | "apply-report" | "legacy-backups" | "snapshot"
     size_bytes: int
 
 
@@ -139,6 +139,8 @@ def scan(
     *,
     keep_recent: int = 1,
     applied_zip_retention: int = 1,
+    snapshots_keep: int = 10,
+    snapshots_max_age_days: int = 14,
 ) -> CleanupPlan:
     """
     Build a plan of everything beyond the most recent `keep_recent` item(s)
@@ -195,6 +197,19 @@ def scan(
         )
         for rp in reports[keep:]:
             items.append(CleanupItem(path=rp, kind="apply-report", size_bytes=_size_of(rp)))
+
+    # ── snapshots/ — versioned history apply-zip merges against. Kept while
+    #    among the newest `snapshots_keep`, younger than the age limit, or
+    #    still awaited by a reply sitting in the inbox (see snapshots.py) ──
+    from contextzip import snapshots as _snapshots
+
+    for folder in _snapshots.prune_candidates(
+        project_dir,
+        keep=snapshots_keep,
+        max_age_days=snapshots_max_age_days,
+        protected=_snapshots.protected_by_inbox(project_dir),
+    ):
+        items.append(CleanupItem(path=folder, kind="snapshot", size_bytes=_size_of(folder)))
 
     return CleanupPlan(workspace=workspace, items=items)
 

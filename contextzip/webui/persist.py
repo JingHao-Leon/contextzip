@@ -26,6 +26,7 @@ def save_config_from_ui(
     limits: dict | None = None,
     applied_zip_retention: int | None = None,
     webui: dict | None = None,
+    zip_guide: bool | None = None,
 ) -> Path:
     """
     Merge the config UI's choices into the project's
@@ -68,6 +69,8 @@ def save_config_from_ui(
         existing["scan_depth"] = scan_depth
     if applied_zip_retention is not None:
         existing["applied_zip_retention"] = applied_zip_retention
+    if zip_guide is not None:
+        existing["zip_guide"] = zip_guide
 
     for key, incoming in (("ai", ai), ("limits", limits), ("webui", webui)):
         if incoming is None:

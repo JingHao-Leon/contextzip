@@ -131,33 +131,60 @@ def get_changed_files(project_dir: Path) -> GitChanges | GitError:
         timeout=8,
     )
     repo_root = (
-        Path(root_proc.stdout.strip()) if root_proc.returncode == 0 else project_dir
+        Path(root_proc.stdout.strip()).resolve()
+        if root_proc.returncode == 0
+        else project_dir
     )
 
-    # ── Run git status --porcelain ───────────────────────────────────────────
+    # ── Status of the repo itself, then every repo nested inside it ──────────
+    # An embedded repo (e.g. the `git init` create-next-app runs inside
+    # frontend/) or a submodule shows up in the outer repo's status as one
+    # opaque entry, so the changes inside it would otherwise be lost.
+    from contextzip.root import nested_git_roots
+
+    result = GitChanges()
+    nested = [r for r in nested_git_roots(repo_root) if _is_within(r, project_dir) or _is_within(project_dir, r)]
+    for repo in [repo_root, *nested]:
+        status = _run_status(repo)
+        if isinstance(status, GitError):
+            if repo == repo_root:
+                return status
+            # A broken nested repo shouldn't sink the whole run — report it
+            # the way submodules always have been: listed, not packaged.
+            result.submodules.append(_display_rel(repo, project_dir))
+            continue
+        _parse_porcelain_z(status, repo, project_dir, result, nested_repos=set(nested))
+
+    return result
+
+
+def _run_status(repo: Path) -> str | GitError:
+    """`git status --porcelain -z` for one repository."""
     try:
         proc = subprocess.run(
-            ["git", "status", "--porcelain", "-u", "--no-renames"],
-            cwd=project_dir,
+            ["git", "status", "--porcelain", "-z", "-u", "--no-renames"],
+            cwd=repo,
             capture_output=True,
-            text=True,
-            timeout=15,
+            timeout=30,
         )
     except subprocess.TimeoutExpired:
         return GitError(
             kind=GitErrorKind.COMMAND_ERROR,
             message="git status timed out — repository may be very large.",
         )
+    except OSError as exc:
+        return GitError(kind=GitErrorKind.COMMAND_ERROR, message=f"Could not run git: {exc}")
 
     if proc.returncode != 0:
-        stderr = proc.stderr.strip()
+        stderr = proc.stderr.decode("utf-8", errors="replace").strip()
         return GitError(
             kind=GitErrorKind.COMMAND_ERROR,
             message=f"git status failed: {stderr or 'unknown error'}",
         )
-
-    # ── Parse the output ─────────────────────────────────────────────────────
-    return _parse_porcelain(proc.stdout, repo_root, project_dir)
+    # -z output is raw bytes in the filesystem encoding; git never quotes or
+    # escapes paths in this mode, so names with spaces or non-ASCII
+    # characters come through exactly.
+    return proc.stdout.decode("utf-8", errors="surrogateescape")
 
 
 # ---------------------------------------------------------------------------
@@ -165,39 +192,55 @@ def get_changed_files(project_dir: Path) -> GitChanges | GitError:
 # ---------------------------------------------------------------------------
 
 
-def _parse_porcelain(
+def _is_within(path: Path, parent: Path) -> bool:
+    try:
+        path.relative_to(parent)
+        return True
+    except ValueError:
+        return False
+
+
+def _display_rel(abs_path: Path, project_dir: Path) -> str:
+    try:
+        return abs_path.relative_to(project_dir).as_posix()
+    except ValueError:
+        return abs_path.as_posix()
+
+
+def _parse_porcelain_z(
     output: str,
     repo_root: Path,
     project_dir: Path,
+    result: GitChanges,
+    *,
+    nested_repos: set[Path] | None = None,
 ) -> GitChanges:
     """
-    Parse ``git status --porcelain`` output into a :class:`GitChanges`.
+    Parse ``git status --porcelain -z`` output for *repo_root* into *result*.
 
-    Each line is ``XY filename`` where X=staged status, Y=unstaged status.
-    With ``--no-renames`` renames appear as D + A pairs, so we handle them
-    naturally without needing to parse the "old -> new" arrow format.
+    Each NUL-terminated record is ``XY path`` (X = staged, Y = unstaged),
+    with *path* relative to *repo_root*. With ``--no-renames`` there is no
+    second "from" path. Paths are reported relative to *project_dir*.
     """
-    result = GitChanges()
+    nested_repos = nested_repos or set()
 
-    for raw_line in output.splitlines():
-        if not raw_line or len(raw_line) < 4:
+    for record in output.split("\0"):
+        if len(record) < 4:
             continue
 
-        xy = raw_line[:2]
-        rel_path = raw_line[3:].strip()
+        x, y = record[0], record[1]
+        rel_in_repo = record[3:]
 
-        # Strip surrounding quotes git adds for paths with spaces/special chars
-        if rel_path.startswith('"') and rel_path.endswith('"'):
-            rel_path = rel_path[1:-1]
-
-        x = xy[0]
-        y = xy[1]
-
-        # Skip ignored files
         if x == "!" and y == "!":
             continue
 
-        abs_path = (repo_root / rel_path).resolve()
+        abs_path = (repo_root / rel_in_repo).resolve()
+        rel_path = _display_rel(abs_path, project_dir)
+
+        # A nested repo we're already scanning on its own — skip its
+        # opaque entry here so its files aren't double-counted or lost.
+        if abs_path in nested_repos:
+            continue
 
         # ── Submodule detection — git marks them as commits not files ─────────
         if _is_submodule(abs_path):
@@ -214,10 +257,14 @@ def _parse_porcelain(
             continue
 
         # ── Skip if outside the project_dir we're operating on ───────────────
-        try:
-            abs_path.relative_to(project_dir)
-        except ValueError:
+        if not _is_within(abs_path, project_dir):
             continue
+
+        # A file can be reported twice: by the outer repo and by a nested
+        # repo that tracks the same path. Count it once.
+        if abs_path in result.files:
+            continue
+        result.files.append(abs_path)
 
         # ── Categorise for display ────────────────────────────────────────────
         if x == "?" and y == "?":
@@ -227,11 +274,30 @@ def _parse_porcelain(
         else:
             result.unstaged.append(rel_path)
 
-        # Deduplicate — a file can appear staged and unstaged simultaneously
-        if abs_path not in result.files:
-            result.files.append(abs_path)
-
     return result
+
+
+def _parse_porcelain(
+    output: str,
+    repo_root: Path,
+    project_dir: Path,
+) -> GitChanges:
+    """
+    Parse classic newline-separated ``git status --porcelain`` output.
+
+    Kept for callers that already have text output; contextzip itself now
+    uses the NUL-separated form (see _parse_porcelain_z), which never
+    quotes or escapes unusual file names.
+    """
+    records = []
+    for line in output.splitlines():
+        if len(line) < 4:
+            continue
+        path = line[3:].strip()
+        if path.startswith('"') and path.endswith('"'):
+            path = path[1:-1]
+        records.append(line[:3] + path)
+    return _parse_porcelain_z("\0".join(records), repo_root.resolve(), project_dir, GitChanges())
 
 
 # ---------------------------------------------------------------------------

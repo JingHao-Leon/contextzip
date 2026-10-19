@@ -73,6 +73,7 @@ def run_watch(
     ecosystems: list[str],
     ecosystem_display: str,
     console: Console,
+    run_dir: Path | None = None,
 ) -> int:
     """
     Spawn *command* as a child process and watch its output for errors.
@@ -85,6 +86,11 @@ def run_watch(
         The command + args to run, e.g. ["npm", "run", "dev"].
     project_dir:
         Absolute path to the project root (used for ZIP workspace + path resolution).
+    run_dir:
+        The folder the command was run from. The child process starts there
+        (so `npm run dev` inside frontend/ still runs in frontend/), and
+        relative paths in stack traces are resolved against it first.
+        Defaults to project_dir.
     ecosystems:
         DetectionResult.ecosystems list, e.g. ["Next.js", "Node.js"].
     ecosystem_display:
@@ -105,7 +111,7 @@ def run_watch(
     try:
         child = subprocess.Popen(
             command,
-            cwd=project_dir,
+            cwd=run_dir or project_dir,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             # Don't create a new process group — let Ctrl+C propagate naturally
@@ -236,6 +242,7 @@ def run_watch(
                         ecosystems=ecosystems,
                         ecosystem_display=ecosystem_display,
                         console=console,
+                        run_dir=run_dir,
                     )
                     if success:
                         packaged_count += 1
@@ -274,6 +281,7 @@ def run_watch(
                     ecosystem_display=ecosystem_display,
                     console=console,
                     is_full_session=True,
+                    run_dir=run_dir,
                 )
         else:
             # Already packaged at least one error — just inform and exit
@@ -485,6 +493,7 @@ def _package_debug_context(
     ecosystem_display: str,
     console: Console,
     is_full_session: bool = False,
+    run_dir: Path | None = None,
 ) -> bool:
     """
     Process the buffer and write debug-context.zip to .contextzip/.
@@ -526,6 +535,7 @@ def _package_debug_context(
                 ecosystem_display=ecosystem_display,
                 always_exclude=project_cfg.always_exclude,
                 always_include=project_cfg.always_include,
+                run_dir=run_dir,
             )
 
             if result is None:

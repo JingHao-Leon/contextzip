@@ -70,7 +70,7 @@ def run_ai_selection(
     if method == USED_HEURISTIC:
         warn("Gemini rate limited — used keyword heuristic instead (less precise)")
 
-    print_ai_selection(selected_paths, project_dir, prompt, con=con)
+    print_ai_selection(selected_paths, project_dir, prompt, method=method, con=con)
     return selected_paths, prompt_txt
 
 
@@ -113,5 +113,5 @@ def run_ai_selection_preview(
     if method == USED_HEURISTIC:
         warn("Gemini rate limited — used keyword heuristic instead (less precise)")
 
-    print_ai_selection(selected_paths, project_dir, prompt, con=con)
+    print_ai_selection(selected_paths, project_dir, prompt, method=method, con=con)
     info("Dry run — no ZIP created. Remove --dry-run to package these files.")

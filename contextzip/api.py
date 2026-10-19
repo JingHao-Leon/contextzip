@@ -35,7 +35,6 @@ Quickstart
 
 from __future__ import annotations
 
-import os
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -158,7 +157,7 @@ def get_git_changes(
     Parameters
     ----------
     path:
-        Directory to start from. Defaults to ``Path.cwd()``. The actual
+        Directory to start from. Defaults to the project root found from the current folder. The actual
         git root may be a parent of this directory.
     use_project_config:
         Apply the project's ``.contextzip/config.json``. Defaults to
@@ -234,7 +233,7 @@ def get_files(
     Parameters
     ----------
     path:
-        Project root to scan. Defaults to ``Path.cwd()``.
+        Project root to scan. Defaults to the project root found from the current folder.
     include:
         If given, only files under these paths are returned (e.g.
         ``["src/", "app/"]``). Matched as exact path prefixes.
@@ -358,10 +357,14 @@ def create_zip(
 
     output_path = Path(output).resolve() if output is not None else None
 
+    project_cfg = load_project_config(collection.project_dir)
     return create_zip_silent(
         resolve_result=resolve_result,
         project_dir=collection.project_dir,
         output_path=output_path,
+        redact_secrets_enabled=project_cfg.limits.redact_secrets,
+        ecosystem=collection.ecosystem,
+        guide=project_cfg.zip_guide,
     )
 
 
@@ -370,20 +373,23 @@ def apply_zip(
     *,
     project_dir: str | Path | None = None,
     manifest: str | Path | None = None,
+    include_risky: bool = False,
 ) -> ApplyResult:
     """
     Apply an AI-returned ZIP back into *project_dir* (defaults to cwd).
 
-    Diffs the zip against the local sidecar manifest most recently written
-    to ``.contextzip/output/`` (or the one at *manifest*, if given) to
-    classify every file as new, modified, unchanged, or one with no safe
-    baseline (locally edited since zipping, or never part of the original
-    manifest). Only adds and modifies files — nothing is ever deleted.
+    Each file is matched to its place in the project (even when the zip is
+    wrapped, relative to a subfolder, or flattened), then compared with the
+    snapshot of what was sent and with the file on disk. New, modified and
+    cleanly merged files are written. Files that need a decision —
+    conflicts, partial files, ones you deleted or that weren't sent, and
+    ambiguous ones — are left alone unless *include_risky* is True, in which
+    case the AI's version wins. Nothing is removed — moved files keep their
+    old copy and requested deletions are skipped; use
+    ``execute_plan(..., remove_moved=True, allow_delete=True)`` to opt in.
 
-    Unlike the CLI, this applies immediately and does not prompt — check
-    ``contextzip.applier.build_plan()`` yourself first if you want to
-    inspect risk before writing (see ``ApplyPlan.is_risky`` /
-    ``.risky_entries``).
+    Doesn't prompt. To inspect first, use ``contextzip.applier.build_plan()``
+    and ``execute_plan(..., decisions=...)`` directly.
 
     Parameters
     ----------
@@ -391,15 +397,20 @@ def apply_zip(
         Path to the returned zip. If omitted, auto-detects from
         ``.contextzip/inbox/`` — exactly one zip must be present there.
     project_dir:
-        Project root to apply into. Defaults to ``Path.cwd()``.
+        Project root to apply into. Defaults to the project root found from the current folder.
     manifest:
-        Explicit manifest path to diff against, overriding auto-detection.
+        Snapshot (manifest) to compare against. By default the one that
+        best matches the zip is picked automatically.
+    include_risky:
+        Also write files that need a decision, with the AI's version
+        winning. Defaults to False.
 
     Returns
     -------
     ApplyResult
-        ``written`` (list of relative paths written) and
-        ``applied_zip_path`` (where the consumed zip ended up).
+        ``written`` (relative paths written), ``skipped`` (paths left alone)
+        and ``applied_zip_path`` (where the zip ended up — it stays in the
+        inbox while something still needs a decision).
 
     Raises
     ------
@@ -431,9 +442,9 @@ def apply_zip(
     except ApplyError as exc:
         raise ZipNotFoundError(str(exc)) from exc
 
-    manifest_path = find_latest_manifest(pdir, manifest)
+    manifest_path = find_latest_manifest(pdir, manifest) if manifest is not None else None
     plan = build_plan(resolved_zip, pdir, manifest_path)
-    return execute_plan(plan, pdir)
+    return execute_plan(plan, pdir, include_risky=include_risky)
 
 
 def detect_ecosystem(
@@ -445,7 +456,7 @@ def detect_ecosystem(
     Parameters
     ----------
     path:
-        Directory to inspect. Defaults to ``Path.cwd()``.
+        Directory to inspect. Defaults to the project root found from the current folder.
 
     Returns
     -------
@@ -498,8 +509,16 @@ def _config_kwargs(cfg, extra_exclude: list[str] | None = None) -> dict:
 
 
 def _resolve_dir(path: str | Path | None) -> Path:
+    """
+    An explicit *path* is used exactly as given. Without one, resolve the
+    project root from the current folder — the same root the CLI uses (see
+    root.find_project_root) — so a script run from a subfolder of a
+    monorepo still works on the whole project with root-relative paths.
+    """
     if path is None:
-        return Path(os.getcwd()).resolve()
+        from contextzip.root import find_project_root
+
+        return find_project_root().root
     return Path(path).resolve()
 
 

@@ -99,6 +99,7 @@ class _ConfigUIState:
             "auto_open": project_cfg.webui.auto_open,
             "port": project_cfg.webui.port,
         }
+        self.zip_guide: bool = project_cfg.zip_guide
 
     def touch(self) -> None:
         self.last_activity = time.monotonic()
@@ -323,6 +324,7 @@ def _make_handler(state: _ConfigUIState):
                     "limits": state.limits,
                     "applied_zip_retention": state.applied_zip_retention,
                     "webui": state.webui,
+                    "zip_guide": state.zip_guide,
                 }
                 payload["configPath"] = str(project_config_path(state.project_dir))
                 self._send_json(200, payload)
@@ -442,6 +444,8 @@ def _make_handler(state: _ConfigUIState):
                 elif isinstance(port, int) and not isinstance(port, bool) and 1024 <= port <= 65535:
                     webui["port"] = port
 
+                zip_guide = body.get("zip_guide") if isinstance(body.get("zip_guide"), bool) else None
+
                 with state.lock:
                     try:
                         saved_path = save_config_from_ui(
@@ -454,6 +458,7 @@ def _make_handler(state: _ConfigUIState):
                             limits=limits or None,
                             applied_zip_retention=applied_zip_retention,
                             webui=webui or None,
+                            zip_guide=zip_guide,
                         )
                     except OSError as exc:
                         self._send_json(500, {"error": str(exc)})
@@ -469,6 +474,8 @@ def _make_handler(state: _ConfigUIState):
                     if applied_zip_retention is not None:
                         state.applied_zip_retention = applied_zip_retention
                     state.webui.update(webui)
+                    if zip_guide is not None:
+                        state.zip_guide = zip_guide
                     state.saved = True
                 self._send_json(200, {"ok": True, "path": str(saved_path)})
                 return

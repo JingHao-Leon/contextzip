@@ -321,9 +321,14 @@ def extract_paths(
     error_block: str,
     project_dir: Path,
     ecosystems: list[str],
+    run_dir: Path | None = None,
 ) -> list[Path]:
     """
     Extract source file paths referenced in *error_block*.
+
+    Relative paths are tried against *run_dir* (where the dev server runs —
+    a Next.js app in frontend/ prints `app/page.tsx`, not
+    `frontend/app/page.tsx`) and then the project root.
 
     Returns absolute Path objects, deduplicated, all confirmed to:
       - Exist on disk
@@ -347,7 +352,7 @@ def extract_paths(
     seen: set[Path] = set()
 
     for raw in candidates:
-        path = _resolve_path(raw, project_dir)
+        path = _resolve_path(raw, project_dir, run_dir)
         if path is None:
             continue
         if path in seen:
@@ -366,31 +371,67 @@ def extract_paths(
     return resolved
 
 
-def _resolve_path(raw: str, project_dir: Path) -> Path | None:
+_SCAN_CACHE: dict[Path, tuple[float, list[Path]]] = {}
+_SCAN_CACHE_SECONDS = 10.0
+
+
+def _project_files(project_dir: Path) -> list[Path]:
+    """
+    The project's files (dependency/build folders pruned), cached briefly:
+    one error block often names several files, and each lookup would
+    otherwise walk the whole tree again.
+    """
+    import time
+
+    from contextzip.filters import scan_all_files
+
+    now = time.monotonic()
+    cached = _SCAN_CACHE.get(project_dir)
+    if cached and now - cached[0] < _SCAN_CACHE_SECONDS:
+        return cached[1]
+    files = [abs_path for abs_path, _size in scan_all_files(project_dir)]
+    _SCAN_CACHE[project_dir] = (now, files)
+    return files
+
+
+def _resolve_path(raw: str, project_dir: Path, run_dir: Path | None = None) -> Path | None:
     """
     Turn a raw path string from a stack trace into an absolute Path.
 
     Handles:
       - Absolute paths as-is
-      - Relative paths (./foo, ../foo) resolved against project_dir
-      - Bare filenames searched recursively in project_dir (last resort)
+      - Relative paths, tried against *run_dir* (where the process runs)
+        and then *project_dir*
+      - Bare or partial paths (e.g. Go/Rust print just "main.rs") matched by
+        suffix against the project's files — dependency and build folders
+        are never searched, and an ambiguous match is preferred under
+        *run_dir* or otherwise dropped rather than guessed
     """
-    raw = raw.strip()
+    raw = raw.strip().replace("\\", "/")
     if not raw:
         return None
 
     p = Path(raw)
-
     if p.is_absolute():
         return p.resolve()
 
-    # Relative path
-    if raw.startswith("./") or raw.startswith("../"):
-        return (project_dir / p).resolve()
+    bases = [b for b in (run_dir, project_dir) if b is not None]
+    for base in bases:
+        candidate = (base / p).resolve()
+        if candidate.is_file():
+            return candidate
 
-    # Bare filename — try to find it in the project
-    # (e.g. Go/Rust sometimes emit just "main.rs")
-    matches = list(project_dir.rglob(raw))
+    if raw.startswith("./") or raw.startswith("../"):
+        return None
+
+    suffix = "/" + raw.lstrip("/")
+    matches = [
+        abs_path
+        for abs_path in _project_files(project_dir)
+        if ("/" + abs_path.relative_to(project_dir).as_posix()).endswith(suffix)
+    ]
+    if len(matches) > 1 and run_dir is not None:
+        matches = [m for m in matches if m.is_relative_to(run_dir)]
     if len(matches) == 1:
         return matches[0].resolve()
 
@@ -457,6 +498,7 @@ def process_buffer(
     ecosystem_display: str,
     always_exclude: list[str] | None = None,
     always_include: list[str] | None = None,
+    run_dir: Path | None = None,
 ) -> tuple[str, str, list[Path]] | None:
     """
     Run the full pipeline on *raw_buffer*.
@@ -501,7 +543,7 @@ def process_buffer(
     terminal_error_txt = strip_noise(error_block_raw, ecosystems)
 
     # 4. Extract file paths
-    referenced_paths = extract_paths(error_block_raw, project_dir, ecosystems)
+    referenced_paths = extract_paths(error_block_raw, project_dir, ecosystems, run_dir=run_dir)
     referenced_paths = filter_paths_by_config(
         referenced_paths, project_dir, always_exclude, always_include
     )

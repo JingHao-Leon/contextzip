@@ -242,7 +242,18 @@ def detect(project_dir: Path, max_scan_depth: int = _MAX_SCAN_DEPTH) -> Detectio
     seen_names: set[str] = set()
     total_weight = 0
 
-    for candidate_dir in _scan_dirs(project_dir, max_scan_depth):
+    candidate_dirs = _scan_dirs(project_dir, max_scan_depth)
+    # Packages a monorepo declares (npm/pnpm/yarn workspaces, Cargo, go.work…)
+    # are checked whatever their depth — see workspaces.py.
+    from contextzip.workspaces import declared_package_dirs
+
+    known = {d.resolve() for d in candidate_dirs}
+    for d in declared_package_dirs(project_dir, candidate_dirs):
+        if d not in known:
+            known.add(d)
+            candidate_dirs.append(d)
+
+    for candidate_dir in candidate_dirs:
         for rule in _RULES:
             if rule.name in seen_names:
                 continue  # already found this ecosystem elsewhere; don't re-check

@@ -114,6 +114,21 @@ class ResolveResult:
 # ---------------------------------------------------------------------------
 
 
+def make_spec(patterns) -> pathspec.PathSpec:
+    """
+    Compile gitignore-style *patterns*.
+
+    Uses pathspec's GitIgnoreSpec — real .gitignore semantics, and the
+    supported API now that the "gitwildmatch" factory is deprecated — and
+    falls back to the old factory on pathspec versions without it.
+    """
+    lines = list(patterns)
+    spec_cls = getattr(pathspec, "GitIgnoreSpec", None)
+    if spec_cls is not None:
+        return spec_cls.from_lines(lines)
+    return pathspec.PathSpec.from_lines("gitwildmatch", lines)
+
+
 def normalize_pattern(p: str) -> str:
     """
     Canonicalise a user-supplied exclusion/inclusion pattern (CLI flag or
@@ -172,7 +187,7 @@ def build_spec(
     if extra_exclude:
         patterns.extend(extra_exclude)
 
-    return pathspec.PathSpec.from_lines("gitwildmatch", patterns)
+    return make_spec(patterns)
 
 
 def build_force_include_spec(patterns: list[str] | None) -> pathspec.PathSpec | None:
@@ -185,7 +200,7 @@ def build_force_include_spec(patterns: list[str] | None) -> pathspec.PathSpec | 
     """
     if not patterns:
         return None
-    return pathspec.PathSpec.from_lines("gitwildmatch", patterns)
+    return make_spec(patterns)
 
 
 def scan_all_files(project_dir: Path) -> list[tuple[Path, int]]:

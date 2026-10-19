@@ -218,6 +218,34 @@ def save_config_ui_dismissed() -> None:
     _write_config(data)
 
 
+# ---------------------------------------------------------------------------
+# Project roots the user said no to
+#
+# When a folder looks like a monorepo without git at the top (only
+# frontend/.git and backend/.git), contextzip asks once whether to use it as
+# the project root (see cli.py's _maybe_suggest_root). A "no" is remembered
+# here, per folder, so the question is never asked again for it.
+# ---------------------------------------------------------------------------
+
+
+def get_declined_roots() -> set[str]:
+    try:
+        value = _read_config().get("declined_roots", [])
+    except Exception:
+        return set()
+    return {v for v in value if isinstance(v, str)} if isinstance(value, list) else set()
+
+
+def save_declined_root(path: str) -> None:
+    _CONFIG_FILE.parent.mkdir(parents=True, exist_ok=True)
+    data = _read_config()
+    roots = [v for v in data.get("declined_roots", []) if isinstance(v, str)]
+    if path not in roots:
+        roots.append(path)
+    data["declined_roots"] = roots
+    _write_config(data)
+
+
 def _write_config(data: dict) -> None:
     """
     Write *data* to the config file and lock its permissions down to the

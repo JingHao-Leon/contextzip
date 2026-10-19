@@ -1,42 +1,60 @@
 """
 applier.py — Apply an AI-returned ZIP back into the project.
 
-This is the other half of the round trip contextzip already does well:
-`contextzip` packages your project *out* to an AI tool; `apply-zip` brings
-the AI's response back *in*, safely.
+This is the other half of the round trip: `contextzip` packages your
+project *out* to an AI tool; `apply-zip` brings the AI's answer back *in*,
+without making you babysit it.
 
-Design
-──────
-Every ZIP `packager.py` creates gets a sidecar manifest written next to it
-on disk (never inside the ZIP — see packager.py's Phase 8 notes). That
-manifest records a hash of each included file at zip-time. When you run
-`contextzip apply-zip`, the incoming ZIP is diffed against that manifest
-to classify every file:
+How a returned ZIP is read
+──────────────────────────
+1. Where does each file belong? AI tools return ZIPs in every shape —
+   wrapped in extra folders, relative to a subfolder, flattened, with
+   Windows separators. pathmatch.py maps every entry onto the project by its
+   longest shared path suffix and generalises the result to new files.
 
-    NEW        — wasn't part of the original zip; no local baseline for it
-    MODIFIED   — was sent, content changed, and the local copy hasn't
-                 moved since — a clean, expected edit
-    UNCHANGED  — identical to what's already on disk; nothing to do
-    DRIFTED    — the local file changed since the zip was made (you edited
-                 it yourself, or it was deleted locally) — applying blindly
-                 here could clobber your own work
-    UNTRACKED  — present in the returned zip but wasn't part of the
-                 original manifest, and already exists locally under that
-                 path — no baseline to compare against
+2. Which snapshot is the baseline? Every ZIP contextzip makes gets a
+   manifest (a hash of each file it sent) kept locally, never inside the
+   ZIP. The manifest that best explains the returned ZIP is chosen — not
+   just the newest one — so an unrelated run in between, or a ZIP written
+   with -o, doesn't turn every file into "drifted".
 
-DRIFTED and UNTRACKED (and the "no manifest at all" case, which naturally
-produces UNTRACKED for every pre-existing path) are what the CLI treats as
-"risky" and prompts about. NEW and MODIFIED apply silently.
+3. What happened to each file? Three versions are compared: the original
+   you sent (read back from the ZIP you sent), the file on disk now, and
+   the AI's version:
 
-v1 scope: only adds and modifies files. Deletions are never inferred or
-performed — a file that used to be in the manifest but is absent from the
-returned zip is simply left alone.
+    NEW        the file doesn't exist yet                       written
+    MODIFIED   only the AI changed it                            written
+    MERGED     you both changed it, in different places          written (3-way merge)
+    UNCHANGED  it already matches — nothing to do                skipped
+    CONFLICT   you both changed the same lines                   needs your call
+    DRIFTED    you changed it and it can't be merged
+               (binary, or the original isn't available)         needs your call
+    DELETED    you deleted it after zipping                      needs your call
+    UNTRACKED  exists here but wasn't in the ZIP you sent        needs your call
+    PARTIAL    the AI returned a cut-down file
+               ("// ... rest of the file unchanged")              needs your call
+    AMBIGUOUS  can't tell which file it belongs to               needs your call
+
+Line endings never count as a change: comparisons ignore CRLF vs LF, and
+text written back keeps the local file's line-ending style and BOM.
+
+Secret files that were redacted on the way out (see redact.py) are always
+merged against the redacted copy you sent, so lines the AI didn't touch
+keep your real values and a "[REDACTED]" placeholder is never written over
+a secret.
+
+Files are only removed with your explicit OK: a file the AI moved (MOVED)
+keeps its old copy unless you choose to remove it, and a deletion the AI
+asks for in CONTEXTZIP.md (DELETE_REQUESTED) needs its own yes — never
+implied by --yes. Either way, a file you've changed since the snapshot is
+never removed. A file that's simply missing from the reply is left alone.
 """
 
 from __future__ import annotations
 
 import hashlib
 import json
+import re
 import shutil
 import tempfile
 import time
@@ -45,11 +63,16 @@ from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
 
+from contextzip.merge3 import merge3
+from contextzip.pathmatch import Rule, match_paths, normalize_name
+
 _MANIFEST_SUFFIX = ".manifest.json"
+_MANIFEST_VERSION = 2
 _INBOX_DIRNAME = "inbox"
 _APPLIED_DIRNAME = "applied"
 _OUTPUT_DIRNAME = "output"  # must match packager._OUTPUT_DIRNAME
 _INBOX_README_NAME = "README.txt"
+_REDACTED = "[REDACTED]"
 
 _INBOX_README_CONTENTS = """\
 Drop your zip here which you want to apply.
@@ -64,16 +87,17 @@ HOW TO USE IT
   2. Drop that zip file directly into this folder — no need to rename
      it or unzip it first.
   3. Run:  contextzip apply-zip     (short alias:  cz apply-zip)
-  4. contextzip finds it automatically, compares every file inside it
-     against your project's manifest, and shows you exactly what's
-     new, modified, or unchanged before writing anything to disk.
+  4. contextzip finds it automatically, works out where every file
+     belongs, compares each one with what you sent and what's on disk
+     now, and shows you exactly what will change before writing anything.
 
 WHAT HAPPENS TO THE ZIP AFTERWARDS
   Once applied, contextzip moves it into inbox/applied/ instead of
   deleting it, so there's always a record of exactly what was applied
-  and when. Old entries there are pruned automatically over time — see
-  the `cleanup` and `applied_zip_retention` settings in
-  .contextzip/config.json if you'd like to keep more of them.
+  and when. If some files still need your decision, the zip stays here
+  so you can run apply-zip again after resolving them. Old entries in
+  applied/ are pruned automatically over time — see the `cleanup` and
+  `applied_zip_retention` settings in .contextzip/config.json.
 
 A FEW THINGS WORTH KNOWING
   - Only .zip files placed directly in this folder are picked up —
@@ -97,22 +121,9 @@ Full docs: https://contextzip.vercel.app/apply-zip
 def ensure_inbox_scaffolding(workspace: Path) -> None:
     """
     Make sure <workspace>/inbox/ exists, with its README.txt explaining
-    what the folder is for.
-
-    Called at the same moment the rest of the .contextzip/ workspace gets
-    set up (see packager.py's `_workspace_output_path[_silent]`), so the
-    inbox is ready and self-explanatory from the very first run — rather
-    than a bare, unexplained folder someone only discovers by reading the
-    docs, or worse, one that doesn't exist yet the first time `apply-zip`
-    goes looking for it.
-
-    Idempotent, same rule as the workspace .gitignore (see
-    `_ensure_workspace_gitignore` in packager.py): leaves an
-    already-correct README.txt untouched, and (re)writes it whenever it's
-    missing or doesn't match, so it stays reliable documentation rather
-    than something that quietly rots or disappears. Never touches
-    anything else already in the inbox — pending zips, `applied/`, past
-    reports.
+    what the folder is for. Idempotent: an already-correct README is left
+    alone, a missing or different one is rewritten, and nothing else in
+    the inbox (pending zips, applied/, reports) is ever touched.
     """
     inbox = workspace / _INBOX_DIRNAME
     inbox.mkdir(parents=True, exist_ok=True)
@@ -129,9 +140,10 @@ def ensure_inbox_scaffolding(workspace: Path) -> None:
     except OSError:
         pass
 
-# Files contextzip itself writes into outgoing ZIPs that should never be
-# written back into the project even if an AI tool echoes them back.
-_IGNORED_ZIP_ENTRIES = {"prompt.txt"}
+
+# Files contextzip itself writes into outgoing ZIPs. Never written back
+# into the project, even if an AI tool echoes them.
+_OWN_ARTIFACTS = {"prompt.txt", "terminal-error.txt", "source-files.zip"}
 
 
 # ---------------------------------------------------------------------------
@@ -171,17 +183,97 @@ class UnsafeZipEntryError(ApplyError):
 class FileStatus(str, Enum):
     NEW = "new"
     MODIFIED = "modified"
+    MERGED = "merged"
     UNCHANGED = "unchanged"
+    CONFLICT = "conflict"
     DRIFTED = "drifted"
+    DELETED = "deleted"
     UNTRACKED = "untracked"
+    PARTIAL = "partial"
+    AMBIGUOUS = "ambiguous"
+    MOVED = "moved"
+    DELETE_REQUESTED = "delete-requested"
+
+
+SAFE_STATUSES = frozenset({FileStatus.NEW, FileStatus.MODIFIED, FileStatus.MERGED, FileStatus.MOVED})
+RISKY_STATUSES = frozenset(
+    {
+        FileStatus.CONFLICT,
+        FileStatus.DRIFTED,
+        FileStatus.DELETED,
+        FileStatus.UNTRACKED,
+        FileStatus.PARTIAL,
+        FileStatus.AMBIGUOUS,
+        FileStatus.DELETE_REQUESTED,
+    }
+)
+
+# How similar a new file must be to a sent file (missing from the reply) to
+# count as that file, moved.
+_MOVE_SIMILARITY = 0.85
+
+STATUS_REASONS = {
+    FileStatus.NEW: "new file",
+    FileStatus.MODIFIED: "changed by the AI",
+    FileStatus.MERGED: "your edits and the AI's merged cleanly",
+    FileStatus.UNCHANGED: "already matches",
+    FileStatus.CONFLICT: "you and the AI changed the same lines",
+    FileStatus.DRIFTED: "you changed it since zipping and it can't be merged",
+    FileStatus.DELETED: "you deleted it after zipping",
+    FileStatus.UNTRACKED: "exists here but wasn't in the zip you sent",
+    FileStatus.PARTIAL: "looks like a partial file — parts were replaced with a placeholder comment",
+    FileStatus.AMBIGUOUS: "can't tell which file this belongs to",
+    FileStatus.MOVED: "moved or renamed by the AI",
+    FileStatus.DELETE_REQUESTED: "the AI asked for this file to be deleted",
+}
 
 
 @dataclass
 class ApplyEntry:
     rel_path: str
+    """Project-relative target path ("" when ambiguous)."""
     status: FileStatus
     size: int
     extracted_path: Path
+    source_name: str = ""
+    """The entry's (normalised) name inside the returned zip."""
+    how: str = "exact"
+    """How the target was found: exact, rule, suffix, content, new, ambiguous."""
+    note: str = ""
+    candidates: list[str] = field(default_factory=list)
+    content: bytes | None = None
+    """What applying this entry writes: the AI's version with the local
+    line endings, or a merge. None when there's nothing safe to write."""
+    incoming: bytes | None = None
+    """The AI's version, adapted to local line endings — used when you
+    choose "take the AI's version" for a risky entry."""
+    conflict_text: str | None = None
+    """For conflicts: the merge with git-style markers, for review/editing."""
+    base_text: str | None = None
+    """The version you sent, when available (for review)."""
+    redacted: bool = False
+    moved_from: str | None = None
+    """For MOVED: the old path. It's only removed with your explicit OK."""
+    removable: bool = True
+    """For MOVED / DELETE_REQUESTED: False when the old file changed since
+    the snapshot, so removing it would lose your work."""
+
+    @property
+    def is_safe(self) -> bool:
+        return self.status in SAFE_STATUSES
+
+    @property
+    def is_risky(self) -> bool:
+        return self.status in RISKY_STATUSES
+
+    @property
+    def display_path(self) -> str:
+        return self.rel_path or self.source_name
+
+    @property
+    def moved(self) -> bool:
+        """True when the file landed somewhere other than its name in the zip."""
+        return bool(self.rel_path) and self.rel_path != self.source_name
 
 
 @dataclass
@@ -190,46 +282,77 @@ class ApplyPlan:
     manifest_path: Path | None
     entries: list[ApplyEntry] = field(default_factory=list)
     extraction_dir: Path = None  # type: ignore[assignment]
-    wrapper_stripped: str | None = None
-    wrapper_note: str | None = None
+    rule: Rule | None = None
+    """Path rewrite inferred from the zip's layout, e.g. "my-app/… → …"."""
+    manifest_note: str | None = None
+    ignored: list[str] = field(default_factory=list)
+    """Zip entries ignored: OS junk and contextzip's own artifacts."""
     structure_warning: str | None = None
+    snapshot: str | None = None
+    """The snapshot this reply was matched to, e.g. "14-k3f9a2"."""
+    matched_by_guide: bool = False
+    """True when the reply echoed CONTEXTZIP.md and named its snapshot."""
 
     @property
     def has_manifest(self) -> bool:
         return self.manifest_path is not None
 
     @property
+    def wrapper_note(self) -> str | None:
+        """Kept for callers of the old API: describes the path rewrite, if any."""
+        return f"Paths remapped {self.rule.describe()}" if self.rule else None
+
+    @property
+    def safe_entries(self) -> list[ApplyEntry]:
+        return [e for e in self.entries if e.is_safe]
+
+    @property
     def writable_entries(self) -> list[ApplyEntry]:
-        """Entries that would actually be written if applied (excludes unchanged)."""
+        """Entries that would change something if applied (everything but unchanged)."""
         return [e for e in self.entries if e.status != FileStatus.UNCHANGED]
 
     @property
     def risky_entries(self) -> list[ApplyEntry]:
-        return [
-            e
-            for e in self.entries
-            if e.status in (FileStatus.DRIFTED, FileStatus.UNTRACKED)
-        ]
+        return [e for e in self.entries if e.is_risky]
+
+    @property
+    def moves(self) -> list[ApplyEntry]:
+        """Moved files whose old copy could be removed."""
+        return [e for e in self.entries if e.status == FileStatus.MOVED and e.moved_from and e.removable]
+
+    @property
+    def deletions(self) -> list[ApplyEntry]:
+        return [e for e in self.entries if e.status == FileStatus.DELETE_REQUESTED]
 
     @property
     def is_risky(self) -> bool:
-        """True if anything here warrants a confirmation prompt before writing."""
-        return (
-            bool(self.risky_entries)
-            or not self.has_manifest
-            or bool(self.structure_warning)
-        )
+        """True if anything here needs a decision before it can be written."""
+        return bool(self.risky_entries) or bool(self.structure_warning)
 
 
 @dataclass
 class ApplyResult:
     written: list[str]
     applied_zip_path: Path
+    skipped: list[str] = field(default_factory=list)
+    """Entries left alone — risky ones nobody decided on, or ones you skipped."""
+    zip_kept: bool = False
+    """True when the zip stayed in the inbox because something was skipped."""
+    removed: list[str] = field(default_factory=list)
+    """Old files removed — only ever with your explicit OK."""
+    not_removed: list[tuple[str, str]] = field(default_factory=list)
+    """(path, reason) for removals that were asked for but refused."""
 
 
 # ---------------------------------------------------------------------------
-# Hashing
+# Content helpers
 # ---------------------------------------------------------------------------
+
+_BOM = b"\xef\xbb\xbf"
+
+
+def _hash_bytes(data: bytes) -> str:
+    return f"sha256:{hashlib.sha256(data).hexdigest()}"
 
 
 def _hash_file(path: Path) -> str:
@@ -238,6 +361,98 @@ def _hash_file(path: Path) -> str:
         for chunk in iter(lambda: f.read(1024 * 1024), b""):
             h.update(chunk)
     return f"sha256:{h.hexdigest()}"
+
+
+def _as_text(data: bytes) -> str | None:
+    """Decoded text with line endings normalised to \\n, or None for binary."""
+    if b"\x00" in data[:8192]:
+        return None
+    if data.startswith(_BOM):
+        data = data[len(_BOM):]
+    try:
+        text = data.decode("utf-8")
+    except UnicodeDecodeError:
+        return None
+    return text.replace("\r\n", "\n").replace("\r", "\n")
+
+
+def _text_hash(data: bytes) -> str | None:
+    text = _as_text(data)
+    return None if text is None else _hash_bytes(text.encode("utf-8"))
+
+
+def _same(a: bytes, b: bytes) -> bool:
+    """Byte-identical, or identical text apart from line endings / BOM."""
+    if a == b:
+        return True
+    ta, tb = _as_text(a), _as_text(b)
+    return ta is not None and ta == tb
+
+
+def _matches_manifest(data: bytes, entry: dict) -> bool:
+    if _hash_bytes(data) == entry.get("hash"):
+        return True
+    text_hash = entry.get("text_hash")
+    return bool(text_hash) and _text_hash(data) == text_hash
+
+
+def _style_of(local: bytes | None) -> tuple[str, bool]:
+    """(newline, has_bom) of a local file; defaults to \\n, no BOM."""
+    if not local:
+        return "\n", False
+    crlf = local.count(b"\r\n")
+    lf = local.count(b"\n") - crlf
+    return ("\r\n" if crlf > lf else "\n"), local.startswith(_BOM)
+
+
+def _encode_like(text: str, local: bytes | None) -> bytes:
+    """Encode normalised *text* with the local file's line endings and BOM."""
+    newline, bom = _style_of(local)
+    data = text.replace("\n", newline).encode("utf-8")
+    return _BOM + data if bom else data
+
+
+def _adapt(incoming: bytes, local: bytes | None) -> bytes:
+    """The AI's file with the local file's line endings — so a one-line fix
+    never shows up as a whole-file change in git."""
+    if local is None:
+        return incoming
+    text = _as_text(incoming)
+    if text is None or _as_text(local) is None:
+        return incoming
+    return _encode_like(text, local)
+
+
+# Placeholder comments AI tools leave instead of code. A returned file that
+# contains one (and the original didn't) is probably not the whole file.
+_PARTIAL_RE = re.compile(
+    r"^\s*(?://|#|/\*+|\*|<!--|--|;)?\s*(?:\.{3}|…)\s*"
+    r"(?:\(?\s*)?(?:rest|remaining|existing|unchanged|same|other|previous|original|keep|omitted)",
+    re.IGNORECASE,
+)
+_PARTIAL_RE_2 = re.compile(
+    r"^\s*(?://|#|/\*+|\*|<!--|--|;)\s*(?:rest of (?:the )?(?:file|code|component|function|class)"
+    r"|(?:existing|remaining|other|previous|original) code"
+    r"|(?:everything|code) (?:else|above|below) (?:is |stays |remains )?(?:unchanged|the same)"
+    r"|unchanged\b)",
+    re.IGNORECASE,
+)
+
+
+def looks_partial(incoming: str, reference: str | None) -> str | None:
+    """
+    The first placeholder line in *incoming* that isn't in *reference*, or
+    None. Catches "// ... rest of the file unchanged", "# existing code",
+    "/* ... */ unchanged" and similar.
+    """
+    ref_lines = set(reference.splitlines()) if reference else set()
+    for line in incoming.splitlines():
+        stripped = line.strip()
+        if not stripped or line in ref_lines:
+            continue
+        if _PARTIAL_RE.match(stripped) or _PARTIAL_RE_2.match(stripped):
+            return stripped
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -250,37 +465,66 @@ def manifest_path_for_zip(zip_path: Path) -> Path:
     return zip_path.parent / f"{zip_path.stem}{_MANIFEST_SUFFIX}"
 
 
-def write_manifest(zip_path: Path, project_dir: Path, included: list[Path]) -> Path:
+def build_manifest(
+    zip_path: Path,
+    project_dir: Path,
+    included: list[Path],
+    *,
+    redacted: list[str] | None = None,
+    skipped: set[Path] | None = None,
+) -> dict:
     """
-    Write the local sidecar manifest for a ZIP that was just created.
-
-    Never written into the ZIP itself — see the module docstring and
-    packager.py's Phase 8 notes for why that separation matters.
+    The manifest for a ZIP that was just created: per file, a hash of what
+    was on disk (plus a line-ending-insensitive hash for text) so apply-zip
+    can tell whether you've changed it since, and which files were redacted
+    on the way out. Saved locally by snapshots.py — never put in the ZIP.
     """
+    skipped = skipped or set()
     files: dict[str, dict] = {}
     for abs_path in included:
-        if not abs_path.is_file():
+        if abs_path in skipped or not abs_path.is_file():
             continue
         try:
             rel = abs_path.relative_to(project_dir).as_posix()
         except ValueError:
             continue
         try:
-            files[rel] = {
-                "hash": _hash_file(abs_path),
-                "size": abs_path.stat().st_size,
-            }
+            data = abs_path.read_bytes()
         except OSError:
             continue
+        entry = {"hash": _hash_bytes(data), "size": len(data)}
+        text_hash = _text_hash(data)
+        if text_hash:
+            entry["text_hash"] = text_hash
+        files[rel] = entry
 
-    manifest = {
+    return {
         "contextzip_manifest": True,
-        "version": 1,
+        "version": _MANIFEST_VERSION,
         "created_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         "zip_filename": zip_path.name,
+        "zip_path": str(zip_path.resolve()),
+        "root": str(project_dir.resolve()),
+        "redacted": sorted(redacted or []),
         "files": files,
     }
 
+
+def write_manifest(
+    zip_path: Path,
+    project_dir: Path,
+    included: list[Path],
+    *,
+    redacted: list[str] | None = None,
+    skipped: set[Path] | None = None,
+) -> Path:
+    """
+    Write a manifest next to *zip_path* (e.g. codebase.manifest.json).
+
+    Kept for API compatibility. contextzip itself now stores manifests in
+    snapshots (see snapshots.py), which also keep a copy of the ZIP.
+    """
+    manifest = build_manifest(zip_path, project_dir, included, redacted=redacted, skipped=skipped)
     manifest_path = manifest_path_for_zip(zip_path)
     manifest_path.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
     return manifest_path
@@ -290,11 +534,53 @@ def load_manifest(path: Path) -> dict:
     """Load and validate a manifest file. Never raises — returns {} if unusable."""
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
+    except (OSError, json.JSONDecodeError, UnicodeDecodeError):
         return {}
     if not isinstance(data, dict) or not data.get("contextzip_manifest"):
         return {}
+    if not isinstance(data.get("files"), dict):
+        data["files"] = {}
     return data
+
+
+class _BaseReader:
+    """Reads the original content of a file from the ZIP a manifest describes."""
+
+    def __init__(self, manifest_path: Path | None, manifest: dict):
+        self._zf: zipfile.ZipFile | None = None
+        self._files: dict = manifest.get("files", {})
+        self._redacted = set(manifest.get("redacted", []))
+        if manifest_path is None:
+            return
+        candidates = []
+        if manifest.get("zip_path"):
+            candidates.append(Path(manifest["zip_path"]))
+        if manifest.get("zip_filename"):
+            candidates.append(manifest_path.parent / manifest["zip_filename"])
+        for c in candidates:
+            try:
+                if c.is_file():
+                    self._zf = zipfile.ZipFile(c)
+                    break
+            except (OSError, zipfile.BadZipFile):
+                continue
+
+    def read(self, rel: str) -> bytes | None:
+        if self._zf is None or rel not in self._files:
+            return None
+        try:
+            data = self._zf.read(rel)
+        except (KeyError, OSError, zipfile.BadZipFile):
+            return None
+        # A redacted file's copy in the zip differs from its manifest hash by
+        # design. Anything else must match, or the zip was replaced since.
+        if rel not in self._redacted and not _matches_manifest(data, self._files[rel]):
+            return None
+        return data
+
+    def close(self) -> None:
+        if self._zf is not None:
+            self._zf.close()
 
 
 # ---------------------------------------------------------------------------
@@ -317,6 +603,14 @@ def inbox_dir(project_dir: Path) -> Path:
 
 def output_dir(project_dir: Path) -> Path:
     return _workspace_dir(project_dir) / _OUTPUT_DIRNAME
+
+
+def _is_within(path: Path, parent: Path) -> bool:
+    try:
+        path.relative_to(parent)
+        return True
+    except ValueError:
+        return False
 
 
 # ---------------------------------------------------------------------------
@@ -343,13 +637,6 @@ def find_zip_to_apply(
 
     inbox = inbox_dir(project_dir)
     if not inbox.is_dir():
-        # Normally created alongside the rest of .contextzip/ the first
-        # time any contextzip command runs (see
-        # ensure_inbox_scaffolding), so this only fires if apply-zip is
-        # somehow the very first command run in a project. Create it now
-        # rather than just describing where it should be — so the folder
-        # (and its README) are actually there for the person to drop a
-        # zip into right after reading this message.
         ensure_inbox_scaffolding(_workspace_dir(project_dir))
         raise NoZipFoundError(
             f"No zip found. Drop the AI-returned zip into {inbox}, "
@@ -367,133 +654,148 @@ def find_zip_to_apply(
     return candidates[0]
 
 
+def list_manifests(project_dir: Path) -> list[Path]:
+    """
+    Every manifest contextzip knows about for this project, newest first:
+    snapshots (see snapshots.py), then manifests written by older versions
+    next to their ZIPs in .contextzip/output/.
+    """
+    from contextzip.snapshots import list_snapshots
+
+    found = [s.manifest_path for s in list_snapshots(project_dir)]
+    out_dir = output_dir(project_dir)
+    if out_dir.is_dir():
+        legacy = [p for p in out_dir.rglob(f"*{_MANIFEST_SUFFIX}") if p.is_file()]
+        found += sorted(legacy, key=lambda p: p.stat().st_mtime, reverse=True)
+    return found
+
+
 def find_latest_manifest(
     project_dir: Path,
     explicit_manifest: str | Path | None = None,
 ) -> Path | None:
     """
-    Resolve which manifest to diff against.
+    The explicit manifest if given (and it exists), else the newest one.
 
-    An explicit path always wins (if it exists). Otherwise picks the most
-    recently modified *.manifest.json anywhere under .contextzip/output/
-    — including its per-mode subfolders (output/codebase/, output/git-changes/,
-    output/prompt/) — since in the normal one-round-trip-at-a-time flow,
-    that's the zip you most recently generated regardless of which mode
-    produced it, which is almost always the right baseline. Returns None
-    if nothing is found (apply-zip still works, just more conservatively).
+    Kept for API compatibility. build_plan now picks the manifest that best
+    explains the returned zip by itself when none is passed — see
+    `_choose_manifest`.
     """
     if explicit_manifest is not None:
         path = Path(explicit_manifest).expanduser().resolve()
         return path if path.is_file() else None
-
-    out_dir = output_dir(project_dir)
-    if not out_dir.is_dir():
-        return None
-
-    candidates = [p for p in out_dir.rglob(f"*{_MANIFEST_SUFFIX}") if p.is_file()]
-    if not candidates:
-        return None
-    return max(candidates, key=lambda p: p.stat().st_mtime)
+    manifests = list_manifests(project_dir)
+    return manifests[0] if manifests else None
 
 
 # ---------------------------------------------------------------------------
-# Safe extraction
+# Reading the returned zip
 # ---------------------------------------------------------------------------
 
 
-def _is_within(path: Path, parent: Path) -> bool:
-    try:
-        path.relative_to(parent)
-        return True
-    except ValueError:
-        return False
-
-
-def _safe_extract(zip_path: Path, dest: Path, strip_prefix: str | None = None) -> None:
+def _extract(zip_path: Path, dest: Path) -> tuple[dict[str, Path], list[str]]:
     """
-    Extract *zip_path* into *dest*, refusing to write anything if any entry
-    would resolve outside *dest* (zip-slip protection). Validated in a full
-    first pass before any file is written, so a malicious entry never
-    causes a partial extraction.
+    Extract every file entry of *zip_path* into *dest* under its normalised
+    name. Returns ({normalised name: extracted path}, [ignored raw names]).
 
-    If *strip_prefix* is given (see `_detect_common_wrapper`), that leading
-    path component is removed from every entry before it's resolved against
-    *dest* — e.g. `codebase/contextzip/config.py` extracts to
-    `contextzip/config.py` instead of recreating a `codebase/` folder.
+    Validated in a full first pass before anything is written: an absolute
+    path, a drive letter or a `..` that climbs out of the zip refuses the
+    whole zip (zip-slip protection), so a malicious entry never causes a
+    partial extraction.
     """
     dest = dest.resolve()
-    strip = f"{strip_prefix}/" if strip_prefix else None
-    with zipfile.ZipFile(zip_path) as zf:
-        targets: dict[str, Path] = {}
+    try:
+        zf = zipfile.ZipFile(zip_path)
+    except zipfile.BadZipFile as exc:
+        raise ApplyError(f"Not a valid zip file: {zip_path} ({exc})") from exc
+
+    with zf:
+        plan: dict[str, zipfile.ZipInfo] = {}
+        ignored: list[str] = []
         for info in zf.infolist():
             if info.is_dir():
                 continue
-            name = info.filename
-            if strip:
-                if not name.startswith(strip):
-                    # Shouldn't happen given how strip_prefix is detected
-                    # (every entry shares it), but never silently misplace
-                    # a file if it somehow doesn't.
-                    continue
-                name = name[len(strip):]
-                if not name:
-                    continue
+            raw = info.filename
+            name = normalize_name(raw)
+            if name is None:
+                ignored.append(raw)
+                continue
+            if re.match(r"^[A-Za-z]:", raw) or raw.replace("\\", "/").startswith("/") or ".." in name.split("/"):
+                raise UnsafeZipEntryError(
+                    f"Refusing to apply: entry '{raw}' points outside the project."
+                )
             target = (dest / name).resolve()
             if not _is_within(target, dest):
                 raise UnsafeZipEntryError(
-                    f"Refusing to apply: entry '{info.filename}' resolves "
-                    "outside the project tree."
+                    f"Refusing to apply: entry '{raw}' resolves outside the project tree."
                 )
-            targets[info.filename] = target
+            plan[name] = info
 
-        for info in zf.infolist():
-            if info.is_dir():
-                continue
-            target = targets.get(info.filename)
-            if target is None:
-                continue
+        extracted: dict[str, Path] = {}
+        for name, info in plan.items():
+            target = dest / name
             target.parent.mkdir(parents=True, exist_ok=True)
             with zf.open(info) as src, target.open("wb") as out:
                 shutil.copyfileobj(src, out)
+            extracted[name] = target
+    return extracted, ignored
 
 
-# ---------------------------------------------------------------------------
-# Wrapper-folder detection ((1) in the apply-zip structure fix)
-# ---------------------------------------------------------------------------
+def _project_paths(project_dir: Path) -> set[str]:
+    """Every file on disk (dependency/build folders pruned), root-relative."""
+    from contextzip.filters import scan_all_files
+
+    out: set[str] = set()
+    for abs_path, _size in scan_all_files(project_dir):
+        try:
+            out.add(abs_path.relative_to(project_dir).as_posix())
+        except ValueError:
+            continue
+    return out
 
 
-def _detect_common_wrapper(names: list[str]) -> str | None:
+def _choose_manifest(
+    candidates: list[Path],
+    extracted: dict[str, Path],
+    project_files: set[str],
+) -> tuple[Path | None, dict, str | None]:
     """
-    If every entry in *names* is nested one level under the exact same
-    single top-level directory, return that directory's name — otherwise
-    None. This is the shape produced by `zip -r out.zip myfolder`, GitHub's
-    "Download ZIP" (`repo-branch/...`), and similar: an incidental wrapper
-    around the real, root-relative paths, rather than an intentional part
-    of the project's structure.
+    The manifest that best explains the returned zip.
 
-    Deliberately conservative: a single root-level file mixed in with the
-    rest (no wrapper actually applies), or more than one top-level
-    directory, both return None rather than guessing.
+    Each candidate is scored by how many returned files map onto files it
+    sent, and how many of those came back byte-for-byte unchanged (a strong
+    sign this is the zip they came from). Ties go to the newest. With no
+    signal at all — a zip of only brand-new files — the newest is used.
     """
-    if not names:
-        return None
-    tops: set[str] = set()
-    for n in names:
-        if "/" not in n:
-            return None
-        tops.add(n.split("/", 1)[0])
-    if len(tops) != 1:
-        return None
-    candidate = next(iter(tops))
-    return candidate or None
+    loaded = [(p, load_manifest(p)) for p in candidates]
+    loaded = [(p, m) for p, m in loaded if m]
+    if not loaded:
+        return None, {}, None
 
+    names = list(extracted)
+    best: tuple[float, int, Path, dict] | None = None
+    for index, (path, manifest) in enumerate(loaded):
+        files = manifest["files"]
+        result = match_paths(names, project_files | set(files), sent=set(files))
+        score = 0.0
+        for m in result.matches:
+            if m.target and m.target in files:
+                score += 1
+                try:
+                    if _matches_manifest(extracted[m.name].read_bytes(), files[m.target]):
+                        score += 2
+                except OSError:
+                    pass
+        key = (score, -index)
+        if best is None or key > (best[0], best[1]):
+            best = (score, -index, path, manifest)
 
-def _match_rate(names: list[str], manifest_files: dict) -> float:
-    """Fraction of *names* that appear as a path in *manifest_files*."""
-    if not names:
-        return 0.0
-    known = sum(1 for n in names if n in manifest_files)
-    return known / len(names)
+    assert best is not None
+    path, manifest = best[2], best[3]
+    note = None
+    if len(loaded) > 1 and path != loaded[0][0]:
+        note = f"Using the snapshot from {path.parent.name}/{path.name} — it matches this zip best"
+    return path, manifest, note
 
 
 # ---------------------------------------------------------------------------
@@ -501,224 +803,386 @@ def _match_rate(names: list[str], manifest_files: dict) -> float:
 # ---------------------------------------------------------------------------
 
 
-def _top_level_dir_match_rate(names: list[str], project_dir: Path) -> float:
-    """
-    Fraction of *names*' unique top-level path segments that exist as a
-    real file or directory directly under *project_dir* right now.
-
-    Used as a fallback signal for wrapper-stripping when the manifest
-    can't settle it — e.g. the freshest manifest on disk is a narrow,
-    git-diff-scoped one (`.contextzip/output/git-changes/...`) that only
-    ever listed a handful of touched files, so a zip full of brand-new
-    files matches it at ~0% whether or not the wrapper is stripped. The
-    manifest is silent either way, but the project's actual top-level
-    layout — `app/`, `components/`, `lib/`, and so on — usually isn't:
-    a genuine wrapper's contents line up with it once stripped, while
-    the raw, unstripped paths (starting with the wrapper's own name)
-    essentially never do.
-    """
-    if not names:
-        return 0.0
-    tops = {n.split("/", 1)[0] for n in names}
-    if not tops:
-        return 0.0
-    existing = sum(1 for t in tops if t and (project_dir / t).exists())
-    return existing / len(tops)
-
-
 def build_plan(
     zip_path: Path,
     project_dir: Path,
-    manifest_path: Path | None,
+    manifest_path: Path | None = None,
+    *,
+    auto_manifest: bool = True,
 ) -> ApplyPlan:
     """
-    Extract *zip_path* to a temp directory and classify every file against
-    *manifest_path* (may be None). Caller is responsible for eventually
-    calling `execute_plan` or `discard_plan` to clean up the temp dir.
+    Read *zip_path*, work out where each file belongs and what applying it
+    would do. Writes nothing to the project. Call `execute_plan` or
+    `discard_plan` afterwards to clean up the temporary extraction.
 
-    Before extracting, checks whether every entry in the zip shares a
-    single wrapping top-level directory (e.g. `codebase/contextzip/...`)
-    that isn't actually part of the project — see `_detect_common_wrapper`.
-    If so, and stripping it would line paths up with the manifest better
-    than leaving them alone, it's stripped automatically. Separately, if a
-    manifest exists and almost none of the resulting paths match it,
-    `structure_warning` is set so the caller can make sure the person
-    actually looks before applying — a zip whose files come out looking
-    all-new is exactly what a silently-mismatched structure produces.
+    *manifest_path* pins the baseline snapshot. Without it (and with
+    *auto_manifest*), the manifest that best matches the zip is chosen.
     """
-    manifest = load_manifest(manifest_path) if manifest_path else {}
-    manifest_files: dict = manifest.get("files", {}) if manifest else {}
-
-    with zipfile.ZipFile(zip_path) as zf:
-        raw_names = sorted(i.filename for i in zf.infolist() if not i.is_dir())
-
-    strip_prefix: str | None = None
-    wrapper_note: str | None = None
-    candidate = _detect_common_wrapper(raw_names)
-    if candidate:
-        stripped_names = [n[len(candidate) + 1:] for n in raw_names]
-        candidate_is_real_dir = (project_dir / candidate).is_dir()
-
-        if manifest_files:
-            # Decide using the manifest — actual ground truth about what
-            # paths this project has — rather than whether a directory of
-            # that name merely happens to exist on disk. That on-disk check
-            # used to gate this whole branch, which backfired on the most
-            # common real case: an AI tool wraps the whole project in a
-            # folder named after the project itself (e.g. "contextzip/"),
-            # and the project's own top-level package/dir happens to share
-            # that exact name — so the wrapper looked "legitimate" and was
-            # never stripped, dumping a nested copy of the project instead
-            # of updating the real files. Comparing manifest match-rates
-            # with vs without stripping gets both cases right: a genuine
-            # wrapper matches far better once stripped, while a zip whose
-            # top-level folder is an intentional part of the project (e.g.
-            # updates confined to an existing "docs/" folder) matches
-            # better *unstripped*, since those paths are already in the
-            # manifest as-is.
-            unstripped_rate = _match_rate(raw_names, manifest_files)
-            stripped_rate = _match_rate(stripped_names, manifest_files)
-            # Only strip when it clearly helps — meaningfully better match
-            # against paths we know this project actually has, not just a
-            # coincidental improvement on a tiny zip.
-            if stripped_rate > unstripped_rate and stripped_rate >= 0.5:
-                strip_prefix = candidate
-                wrapper_note = (
-                    f"Removed wrapping folder '{candidate}/' present in every "
-                    f"zip entry — {stripped_rate:.0%} of paths matched the "
-                    f"project manifest after stripping vs {unstripped_rate:.0%} "
-                    "before."
-                )
-            elif stripped_rate == unstripped_rate and not candidate_is_real_dir:
-                # The manifest didn't help decide either way — most often
-                # because the manifest in use is scoped to a small subset
-                # of the project (e.g. a git-diff manifest from
-                # output/git-changes/, which only ever tracked the files
-                # touched in one change) rather than the whole tree, so a
-                # zip of brand-new files matches it at 0% regardless of
-                # stripping. Fall back to checking whether the paths line
-                # up with the project's real, current top-level layout
-                # instead of giving up and leaving the wrapper in place.
-                dir_unstripped_rate = _top_level_dir_match_rate(raw_names, project_dir)
-                dir_stripped_rate = _top_level_dir_match_rate(stripped_names, project_dir)
-                if dir_stripped_rate > dir_unstripped_rate and dir_stripped_rate >= 0.5:
-                    strip_prefix = candidate
-                    wrapper_note = (
-                        f"Removed wrapping folder '{candidate}/' present in "
-                        "every zip entry — the project manifest in use didn't "
-                        "cover enough of these paths to tell either way "
-                        "(likely scoped to a specific change rather than the "
-                        "whole project), but "
-                        f"{dir_stripped_rate:.0%} of the stripped paths' "
-                        "top-level folders match this project's real layout "
-                        f"vs {dir_unstripped_rate:.0%} before — double-check "
-                        "the result before trusting it."
-                    )
-        elif not candidate_is_real_dir:
-            # No manifest to confirm against, so this is a softer call —
-            # still strip (matches how `tar` and GitHub's own zip downloads
-            # behave) as long as the project doesn't already have a real
-            # folder of that name, but say so plainly since it's not
-            # manifest-verified. Where the on-disk layout backs it up, say
-            # that too rather than leaving the caveat maximally vague.
-            strip_prefix = candidate
-            dir_stripped_rate = _top_level_dir_match_rate(stripped_names, project_dir)
-            if dir_stripped_rate >= 0.5:
-                wrapper_note = (
-                    f"Removed wrapping folder '{candidate}/' present in every "
-                    f"zip entry — {dir_stripped_rate:.0%} of the stripped "
-                    "paths' top-level folders match this project's real "
-                    "layout (no manifest available to confirm further)."
-                )
-            else:
-                wrapper_note = (
-                    f"Removed wrapping folder '{candidate}/' present in every zip "
-                    "entry (no manifest available to confirm — double-check the "
-                    "result before trusting it)."
-                )
-
+    project_dir = project_dir.resolve()
     extraction_dir = Path(tempfile.mkdtemp(prefix="contextzip-apply-"))
-    _safe_extract(zip_path, extraction_dir, strip_prefix=strip_prefix)
+    try:
+        extracted, ignored = _extract(zip_path, extraction_dir)
+    except Exception:
+        shutil.rmtree(extraction_dir, ignore_errors=True)
+        raise
+
+    project_files = _project_paths(project_dir)
+
+    # The reply may echo the CONTEXTZIP.md we sent: it names the snapshot it
+    # answers and can list moved/deleted files. It's never applied as a file.
+    from contextzip.guide import find_in_zip, parse as parse_guide
+
+    guide = None
+    guide_name = find_in_zip(list(extracted))
+    if guide_name is not None and guide_name.rsplit("/", 1)[-1] not in project_files:
+        try:
+            guide = parse_guide(extracted[guide_name].read_text(encoding="utf-8", errors="replace"))
+        except OSError:
+            guide = None
+        extracted.pop(guide_name)
+        ignored.append(guide_name)
+
+    manifest_note = None
+    matched_by_guide = False
+    manifest: dict = {}
+    if manifest_path is not None:
+        manifest = load_manifest(manifest_path)
+        if not manifest:
+            manifest_path = None
+    elif auto_manifest:
+        from contextzip.snapshots import find as find_snapshot
+
+        snap = find_snapshot(project_dir, guide.snapshot) if guide and guide.snapshot else None
+        if snap is not None:
+            manifest_path, manifest = snap.manifest_path, load_manifest(snap.manifest_path)
+            matched_by_guide = bool(manifest)
+        if not manifest:
+            manifest_path, manifest, manifest_note = _choose_manifest(
+                list_manifests(project_dir), extracted, project_files
+            )
+            if guide and guide.snapshot:
+                manifest_note = (
+                    f"The reply is for snapshot {guide.snapshot}, which isn't here "
+                    "(made on another machine, or already pruned) — matched by content instead"
+                )
+
+    manifest_files: dict = manifest.get("files", {}) if manifest else {}
+    redacted = set(manifest.get("redacted", [])) if manifest else set()
+    base_reader = _BaseReader(manifest_path, manifest or {})
+
+    def read_known(rel: str) -> bytes | None:
+        base = base_reader.read(rel)
+        if base is not None:
+            return base
+        try:
+            return (project_dir / rel).read_bytes()
+        except OSError:
+            return None
+
+    result = match_paths(
+        list(extracted),
+        project_files | set(manifest_files),
+        sent=set(manifest_files),
+        read_entry=lambda n: extracted[n].read_bytes(),
+        read_known=read_known,
+    )
+
+    # A move the reply declares in CONTEXTZIP.md beats path matching: without
+    # this, "lib/a.py" (moved from "a.py") would be matched back onto "a.py"
+    # by its file name and look like an edit of the old file.
+    if guide and guide.moves:
+        declared_dsts = {dst for _src, dst in guide.moves}
+        claimed = {m.target for m in result.matches if m.target}
+        for m in result.matches:
+            hit = next((d for d in declared_dsts if m.name == d or m.name.endswith("/" + d)), None)
+            if hit is not None and m.target != hit and (hit not in claimed or hit == m.target):
+                claimed.discard(m.target)
+                m.target, m.how = hit, "new"
+                claimed.add(hit)
 
     entries: list[ApplyEntry] = []
-    for extracted in sorted(extraction_dir.rglob("*")):
-        if not extracted.is_file():
+    for m in result.matches:
+        path = extracted[m.name]
+        # contextzip's own files (prompt.txt, …) echoed back by the AI
+        if m.name.rsplit("/", 1)[-1] in _OWN_ARTIFACTS and (m.target is None or m.target not in project_files):
+            ignored.append(m.name)
             continue
-
-        rel = extracted.relative_to(extraction_dir).as_posix()
-        if rel in _IGNORED_ZIP_ENTRIES:
-            continue
-
-        size = extracted.stat().st_size
-        live_path = project_dir / rel
-        manifest_entry = manifest_files.get(rel)
-
-        if manifest_entry is None:
-            # No baseline for this path at all — either genuinely new, or
-            # (if it already exists locally) something we can't safely
-            # compare, so we don't assume it's a clean overwrite.
-            status = FileStatus.NEW if not live_path.is_file() else FileStatus.UNTRACKED
-        elif not live_path.is_file():
-            # Was part of the original manifest but no longer exists locally
-            # (e.g. you deleted it after zipping). Applying blindly would
-            # resurrect a file you removed on purpose, so this counts as
-            # drift rather than a plain new/modified write.
-            status = FileStatus.DRIFTED
-        else:
-            original_hash = manifest_entry.get("hash")
-            live_hash = _hash_file(live_path)
-            new_hash = _hash_file(extracted)
-            if live_hash != original_hash:
-                status = FileStatus.DRIFTED
-            elif new_hash != original_hash:
-                status = FileStatus.MODIFIED
-            else:
-                status = FileStatus.UNCHANGED
-
         entries.append(
-            ApplyEntry(rel_path=rel, status=status, size=size, extracted_path=extracted)
+            _classify(
+                m.name,
+                m.target,
+                m.how,
+                m.candidates,
+                path,
+                project_dir,
+                manifest_files,
+                redacted,
+                base_reader,
+            )
         )
+    _detect_moves(entries, manifest_files, project_dir, base_reader, guide)
+    entries.extend(_requested_deletions(guide, entries, project_files, manifest_files, project_dir, result.rule))
+    base_reader.close()
 
-    structure_warning: str | None = None
+    entries.sort(key=lambda e: (e.status not in RISKY_STATUSES, e.display_path))
+
+    structure_warning = None
     if manifest_files and len(entries) >= 3:
-        known = sum(1 for e in entries if e.rel_path in manifest_files)
-        rate = known / len(entries)
-        if rate < 0.1:
-            if strip_prefix and "top-level folders match" in (wrapper_note or ""):
-                # The wrapper was already resolved via the on-disk layout
-                # fallback above, so don't re-cast that as if the wrapper
-                # check itself came up empty — it didn't, the manifest just
-                # doesn't happen to cover these particular files.
-                structure_warning = (
-                    f"Only {known} of {len(entries)} files in this zip match "
-                    "paths from the project manifest. The wrapper folder was "
-                    "still resolved using the project's real directory "
-                    "layout (see above), but none of these exact files were "
-                    "in the manifest, so this may be new work the manifest "
-                    "predates rather than a mismatch — worth a quick look "
-                    "before applying."
-                )
-            else:
-                structure_warning = (
-                    f"Only {known} of {len(entries)} files in this zip match paths "
-                    "from the project manifest, even after checking for a wrapping "
-                    "folder. That usually means the zip's internal structure "
-                    "doesn't line up with this project — the wrong zip, or one "
-                    "built with an unexpected layout. Applying it as-is will "
-                    "likely create a pile of unrelated new files rather than "
-                    "update the ones you meant to change. Double-check the zip "
-                    "before proceeding."
-                )
+        placed = sum(1 for e in entries if e.rel_path and e.rel_path in manifest_files)
+        if placed == 0 and all(e.status in (FileStatus.NEW, FileStatus.AMBIGUOUS) for e in entries):
+            structure_warning = (
+                f"None of the {len(entries)} files in this zip match anything you sent — "
+                "is this the right zip? Check the paths below before applying."
+            )
 
     return ApplyPlan(
         zip_path=zip_path,
         manifest_path=manifest_path,
         entries=entries,
         extraction_dir=extraction_dir,
-        wrapper_stripped=strip_prefix,
-        wrapper_note=wrapper_note,
+        rule=result.rule,
+        manifest_note=manifest_note,
+        ignored=ignored + result.skipped,
         structure_warning=structure_warning,
+        snapshot=_snapshot_label(manifest) if manifest else None,
+        matched_by_guide=matched_by_guide,
     )
+
+
+def _snapshot_label(manifest: dict) -> str | None:
+    if "snapshot_id" in manifest and manifest.get("token"):
+        return f"{manifest['snapshot_id']}-{manifest['token']}"
+    return None
+
+
+def _unchanged_since_snapshot(rel: str, manifest_files: dict, project_dir: Path) -> bool:
+    entry = manifest_files.get(rel)
+    path = project_dir / rel
+    if entry is None or not path.is_file():
+        return False
+    try:
+        return _matches_manifest(path.read_bytes(), entry)
+    except OSError:
+        return False
+
+
+def _detect_moves(entries, manifest_files: dict, project_dir: Path, base_reader, guide) -> None:
+    """
+    Mark NEW files that are really a sent file at a new path as MOVED:
+    declared in the reply's CONTEXTZIP.md, or near-identical in content to a
+    sent file the reply left out. The new file is still a safe write; the
+    old one is only removed with your explicit OK (see execute_plan).
+    """
+    from contextzip.pathmatch import _similarity
+
+    returned = {e.rel_path for e in entries if e.rel_path}
+    declared = {dst: src for src, dst in (guide.moves if guide else [])}
+    gone = [
+        rel for rel in manifest_files
+        if rel not in returned and (project_dir / rel).is_file()
+    ]
+
+    for e in entries:
+        if e.status != FileStatus.NEW or not e.rel_path:
+            continue
+        src = declared.get(e.rel_path)
+        if src is None:
+            src = next((s for d, s in declared.items() if e.rel_path.endswith("/" + d) or d.endswith("/" + e.rel_path)), None)
+        if src is not None and src not in manifest_files and (project_dir / src).is_file():
+            pass  # declared move of a file that wasn't sent — still honour it
+        elif src is None:
+            try:
+                incoming = e.extracted_path.read_bytes()
+            except OSError:
+                continue
+            ext = Path(e.rel_path).suffix
+            best: tuple[float, str] | None = None
+            for rel in gone:
+                if Path(rel).suffix != ext:
+                    continue
+                size = manifest_files[rel].get("size", 0)
+                if size and not (0.5 <= len(incoming) / max(size, 1) <= 2.0):
+                    continue
+                original = base_reader.read(rel)
+                if original is None:
+                    try:
+                        original = (project_dir / rel).read_bytes()
+                    except OSError:
+                        continue
+                score = _similarity(incoming, original)
+                if score >= _MOVE_SIMILARITY and (best is None or score > best[0]):
+                    best = (score, rel)
+            if best is None:
+                continue
+            src = best[1]
+        if src is None or not (project_dir / src).is_file():
+            continue
+
+        e.status = FileStatus.MOVED
+        e.moved_from = src
+        e.removable = _unchanged_since_snapshot(src, manifest_files, project_dir)
+        e.note = (
+            f"moved from {src} — the old file stays unless you choose to remove it"
+            if e.removable
+            else f"moved from {src} — you've changed {src} since, so it won't be removed"
+        )
+        if src in gone:
+            gone.remove(src)
+
+
+def _requested_deletions(guide, entries, project_files: set[str], manifest_files: dict, project_dir: Path, rule) -> list:
+    """Files the reply's CONTEXTZIP.md asks to delete — risky, never automatic."""
+    if not guide or not guide.deletions:
+        return []
+    taken = {e.rel_path for e in entries} | {e.moved_from for e in entries if e.moved_from}
+    out = []
+    for raw in guide.deletions:
+        target = raw if raw in project_files else (rule.apply(raw) if rule and rule.applies(raw) else None)
+        if target is None or target not in project_files:
+            hits = [p for p in project_files if p.endswith("/" + raw)]
+            target = hits[0] if len(hits) == 1 else None
+        if target is None or target in taken:
+            continue
+        taken.add(target)
+        removable = _unchanged_since_snapshot(target, manifest_files, project_dir)
+        out.append(
+            ApplyEntry(
+                rel_path=target,
+                status=FileStatus.DELETE_REQUESTED,
+                size=0,
+                extracted_path=Path(),
+                source_name=raw,
+                how="exact" if target == raw else "rule",
+                removable=removable,
+                note=(
+                    "the AI asked for this file to be deleted"
+                    if removable
+                    else "the AI asked to delete it, but you've changed it since — it won't be deleted"
+                ),
+            )
+        )
+    return out
+
+
+def _classify(
+    name: str,
+    target: str | None,
+    how: str,
+    candidates: list[str],
+    extracted: Path,
+    project_dir: Path,
+    manifest_files: dict,
+    redacted: set[str],
+    base_reader: _BaseReader,
+) -> ApplyEntry:
+    theirs = extracted.read_bytes()
+    entry = ApplyEntry(
+        rel_path=target or "",
+        status=FileStatus.AMBIGUOUS,
+        size=len(theirs),
+        extracted_path=extracted,
+        source_name=name,
+        how=how,
+        candidates=candidates,
+        redacted=bool(target and target in redacted),
+    )
+    if target is None:
+        entry.note = (
+            f"could be {', '.join(candidates[:4])}" if candidates else "no matching file in the project"
+        )
+        return entry
+
+    live_path = project_dir / target
+    try:
+        live = live_path.read_bytes() if live_path.is_file() else None
+    except OSError:
+        live = None
+    baseline = manifest_files.get(target)
+    base = base_reader.read(target) if baseline else None
+    entry.base_text = _as_text(base) if base is not None else None
+    entry.incoming = _adapt(theirs, live)
+
+    theirs_text = _as_text(theirs)
+    reference = _as_text(base) if base is not None else (_as_text(live) if live is not None else None)
+
+    # ── Doesn't exist locally ────────────────────────────────────────────────
+    if live is None:
+        if baseline:
+            entry.status = FileStatus.DELETED
+            entry.note = "you deleted it after zipping — applying brings it back"
+        else:
+            entry.status = FileStatus.NEW
+            entry.content = theirs
+        return entry
+
+    # ── Already the same ─────────────────────────────────────────────────────
+    if _same(theirs, live):
+        entry.status = FileStatus.UNCHANGED
+        if baseline and not _matches_manifest(live, baseline):
+            entry.note = "already applied"
+        return entry
+
+    # ── Placeholder comments instead of code ─────────────────────────────────
+    if theirs_text is not None and reference is not None:
+        marker = looks_partial(theirs_text, reference)
+        if marker:
+            entry.status = FileStatus.PARTIAL
+            entry.note = f'contains "{marker[:60]}" — applying it would delete code'
+            return entry
+
+    # ── No baseline for a file that exists ───────────────────────────────────
+    if not baseline:
+        entry.status = FileStatus.UNTRACKED
+        entry.note = STATUS_REASONS[FileStatus.UNTRACKED]
+        return entry
+
+    live_drifted = not _matches_manifest(live, baseline)
+
+    # ── Only the AI changed it ───────────────────────────────────────────────
+    if not live_drifted and not entry.redacted:
+        entry.status = FileStatus.MODIFIED
+        entry.content = entry.incoming
+        return entry
+
+    # ── Both changed (or a redacted file): three-way merge ───────────────────
+    live_text = _as_text(live)
+    base_text = entry.base_text
+    if theirs_text is None or live_text is None or base_text is None:
+        entry.status = FileStatus.DRIFTED
+        entry.note = (
+            "binary file — can't be merged"
+            if theirs_text is None or live_text is None
+            else "the zip you sent is gone, so there's nothing to merge against"
+        )
+        return entry
+
+    merged = merge3(base_text.split("\n"), live_text.split("\n"), theirs_text.split("\n"))
+    merged_text = "\n".join(merged.lines)
+    if merged.clean and merged_text == live_text:
+        entry.status = FileStatus.UNCHANGED
+        entry.note = "nothing new from the AI"
+        return entry
+    if not merged.clean:
+        entry.status = FileStatus.CONFLICT
+        entry.conflict_text = merged_text
+        n = len(merged.conflicts)
+        entry.note = f"{n} place{'s' if n != 1 else ''} where you and the AI changed the same lines"
+        return entry
+
+    if entry.redacted and _REDACTED in merged_text and merged_text.count(_REDACTED) > live_text.count(_REDACTED):
+        entry.status = FileStatus.CONFLICT
+        entry.conflict_text = merged_text
+        entry.note = "the AI's version still has [REDACTED] placeholders where your real values go"
+        return entry
+
+    entry.content = _encode_like(merged_text, live)
+    if live_drifted:
+        entry.status = FileStatus.MERGED
+        entry.note = STATUS_REASONS[FileStatus.MERGED]
+    else:
+        entry.status = FileStatus.MODIFIED
+        entry.note = "your secret values were kept" if entry.redacted else ""
+    return entry
 
 
 def discard_plan(plan: ApplyPlan) -> None:
@@ -737,15 +1201,10 @@ def _move_zip_to_applied(
     """
     Move a consumed inbox zip into .contextzip/inbox/applied/, timestamped,
     so it can't be accidentally re-applied. Zips passed by an explicit path
-    outside the inbox are left where the user put them rather than being
-    moved unexpectedly.
+    outside the inbox are left where the user put them.
 
-    Keeps at most *retain* applied zips (default 1 — only the most recent).
-    Filenames are timestamp-prefixed, so a lexicographic sort is also a
-    chronological one; the oldest are pruned first, before this run's zip
-    is moved in, so the folder never holds more than *retain* at once.
-    Typically a project's `applied_zip_retention` preference
-    (.contextzip/config.json) — raise it to keep a longer audit trail.
+    Keeps at most *retain* applied zips (default 1 — only the most recent);
+    the oldest are pruned first.
     """
     if zip_path.parent.resolve() != inbox_dir(project_dir).resolve():
         return zip_path
@@ -755,14 +1214,12 @@ def _move_zip_to_applied(
 
     retain = max(1, retain)
     existing = sorted(applied_dir.glob("*.zip"))
-    # Keep room for the zip we're about to add: prune down to retain - 1
-    # existing entries before moving the new one in.
     overflow = len(existing) - (retain - 1)
     for old in existing[: max(0, overflow)]:
         try:
             old.unlink()
         except OSError:
-            pass  # best-effort — a leftover old zip isn't worth failing the apply over
+            pass
 
     stamp = time.strftime("%Y%m%d-%H%M%S")
     dest = applied_dir / f"{stamp}-{zip_path.name}"
@@ -773,36 +1230,128 @@ def _move_zip_to_applied(
     return dest
 
 
-def execute_plan(plan: ApplyPlan, project_dir: Path, retain: int = 1) -> ApplyResult:
-    """
-    Write every non-unchanged entry from *plan* into the project.
+# A decision for one entry, keyed by the entry's display_path:
+#   "apply"  write entry.content (safe entries) or the AI's version (risky)
+#   "theirs" write the AI's version, whatever the status
+#   "keep"   leave the file as it is on disk
+#   "skip"   same as keep
+#   {"action": "custom", "content": "..."}       write this text
+#   {"action": "apply", "target": "path/x.ts"}   place an ambiguous file here
 
-    Assumes the caller has already decided to proceed — dry-run and
-    confirmation prompts are handled upstream (see cli.py's `apply-zip`
-    command). Files are overwritten directly, with no backup taken first:
-    `build_plan`'s manifest diff and the confirmation prompt it drives
-    (see `ApplyPlan.is_risky`) are the safety net here, and the zip you
-    just applied is itself always recoverable — it's archived to
-    `.contextzip/inbox/applied/` (or left wherever you pointed at it)
-    rather than deleted.
 
-    *retain* caps how many applied zips are kept in
-    .contextzip/inbox/applied/ — typically a project's
-    `applied_zip_retention` preference (.contextzip/config.json).
+def execute_plan(
+    plan: ApplyPlan,
+    project_dir: Path,
+    retain: int = 1,
+    *,
+    decisions: dict | None = None,
+    include_risky: bool = False,
+    remove_moved: bool = False,
+    allow_delete: bool = False,
+) -> ApplyResult:
     """
+    Write the plan into the project.
+
+    Safe entries (new, modified, merged) are written unless a decision says
+    otherwise. Risky entries are only written when *include_risky* is True
+    (the AI's version wins) or a decision covers them. Ambiguous entries need
+    a decision with a target. Unchanged entries are never touched.
+
+    The zip is archived to .contextzip/inbox/applied/ when everything was
+    settled; if something was skipped it stays in the inbox so apply-zip can
+    be run again after resolving it.
+    """
+    decisions = decisions or {}
     workspace_root = _workspace_dir(project_dir)
-    to_write = plan.writable_entries
+    root = project_dir.resolve()
 
     written: list[str] = []
-    for entry in to_write:
-        dest = project_dir / entry.rel_path
-        dest.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(entry.extracted_path, dest)
-        written.append(entry.rel_path)
+    skipped: list[str] = []
+    removed: list[str] = []
+    not_removed: list[tuple[str, str]] = []
+    manifest_files = (load_manifest(plan.manifest_path).get("files", {}) if plan.manifest_path else {})
 
-    applied_zip_path = _move_zip_to_applied(
-        plan.zip_path, project_dir, workspace_root, retain=retain
-    )
+    def remove(rel: str) -> None:
+        path = (root / rel).resolve()
+        if not _is_within(path, root) or not path.is_file():
+            not_removed.append((rel, "not found"))
+        elif not _unchanged_since_snapshot(rel, manifest_files, root):
+            not_removed.append((rel, "changed since the snapshot — kept"))
+        else:
+            path.unlink()
+            removed.append(rel)
+
+    for entry in plan.entries:
+        if entry.status == FileStatus.UNCHANGED:
+            continue
+
+        decision = decisions.get(entry.display_path)
+        action = decision.get("action") if isinstance(decision, dict) else decision
+
+        if entry.status == FileStatus.DELETE_REQUESTED:
+            # Deleting needs its own explicit yes — --yes alone never deletes.
+            if action == "delete" or (action is None and allow_delete):
+                remove(entry.rel_path)
+            else:
+                skipped.append(entry.display_path)
+            continue
+        target = entry.rel_path
+        if isinstance(decision, dict) and decision.get("target"):
+            target = str(decision["target"]).replace("\\", "/").strip("/")
+
+        data: bytes | None
+        if action in ("keep", "skip"):
+            data = None
+        elif action == "custom" and isinstance(decision, dict):
+            live_path = root / target
+            live = live_path.read_bytes() if live_path.is_file() else None
+            text = str(decision.get("content", "")).replace("\r\n", "\n")
+            data = _encode_like(text, live)
+        elif action == "theirs":
+            data = entry.incoming
+        elif action == "apply" or (action is None and (entry.is_safe or include_risky)):
+            data = entry.content if entry.is_safe else entry.incoming
+        else:
+            data = None
+
+        if data is None or not target:
+            skipped.append(entry.display_path)
+            continue
+
+        dest = (root / target).resolve()
+        if not _is_within(dest, root) or target.split("/", 1)[0] in (".git", ".contextzip"):
+            skipped.append(entry.display_path)
+            continue
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        dest.write_bytes(data)
+        written.append(target)
+
+        if entry.status == FileStatus.MOVED and entry.moved_from:
+            wants = (decision.get("remove_old") if isinstance(decision, dict) else None)
+            if wants is True or (wants is None and remove_moved):
+                remove(entry.moved_from)
+
+    risky_left = [
+        s for s in skipped
+        if any(e.display_path == s and e.is_risky and e.status != FileStatus.DELETE_REQUESTED for e in plan.entries)
+    ]
+    if risky_left:
+        applied_zip_path, kept = plan.zip_path, True
+    else:
+        applied_zip_path = _move_zip_to_applied(plan.zip_path, project_dir, workspace_root, retain=retain)
+        kept = False
     shutil.rmtree(plan.extraction_dir, ignore_errors=True)
 
-    return ApplyResult(written=written, applied_zip_path=applied_zip_path)
+    if plan.manifest_path is not None and (written or removed) and not kept:
+        from contextzip.snapshots import mark_applied
+
+        mark_applied(plan.manifest_path)
+
+    return ApplyResult(
+        written=written,
+        applied_zip_path=applied_zip_path,
+        skipped=skipped,
+        zip_kept=kept,
+        removed=removed,
+        not_removed=not_removed,
+    )

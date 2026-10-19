@@ -38,7 +38,12 @@ Currently supports:
       "cleanup": {
         "enabled": true,
         "keep_recent": 1
-      }
+      },
+      "snapshots": {
+        "keep": 10,
+        "max_age_days": 14
+      },
+      "zip_guide": true
     }
 
 All keys are optional. Missing or malformed values fall through to the
@@ -130,6 +135,18 @@ built-in default for the newer preference fields.
                         keep only the latest of each, delete everything
                         older immediately.
 
+  snapshots
+      Every package is kept as a numbered snapshot (see snapshots.py) so
+      apply-zip can merge an AI reply against exactly what was sent, even
+      after you've packaged again. A snapshot is kept while it's among the
+      newest `keep`, younger than `max_age_days`, or still waiting on a
+      reply in the inbox.
+
+  zip_guide
+      Whether every ZIP carries a CONTEXTZIP.md (see guide.py): the
+      snapshot ID plus short instructions that make AI replies easy to
+      apply. Default true.
+
 The schema is intentionally a flat, easily-extended dict so future
 preferences can be added without another migration.
 
@@ -168,6 +185,10 @@ _DEFAULT_WEBUI_PORT = None
 _DEFAULT_CLEANUP_ENABLED = True
 _DEFAULT_CLEANUP_KEEP_RECENT = 1
 
+_DEFAULT_SNAPSHOTS_KEEP = 10
+_DEFAULT_SNAPSHOTS_MAX_AGE_DAYS = 14
+_DEFAULT_ZIP_GUIDE = True
+
 
 @dataclass
 class AIConfig:
@@ -196,6 +217,14 @@ class CleanupConfig:
 
 
 @dataclass
+class SnapshotsConfig:
+    """How long versioned snapshots (see snapshots.py) are kept."""
+
+    keep: int = _DEFAULT_SNAPSHOTS_KEEP
+    max_age_days: int = _DEFAULT_SNAPSHOTS_MAX_AGE_DAYS
+
+
+@dataclass
 class ProjectConfig:
     workspace_location: str | None = None
     scan_depth: int | None = None
@@ -206,6 +235,8 @@ class ProjectConfig:
     applied_zip_retention: int = _DEFAULT_APPLIED_ZIP_RETENTION
     webui: WebUIConfig = field(default_factory=WebUIConfig)
     cleanup: CleanupConfig = field(default_factory=CleanupConfig)
+    snapshots: SnapshotsConfig = field(default_factory=SnapshotsConfig)
+    zip_guide: bool = _DEFAULT_ZIP_GUIDE
 
     # Diagnostics — not part of the schema, set by load_project_config so
     # callers (the CLI) can decide whether to surface a deprecation notice.
@@ -214,11 +245,10 @@ class ProjectConfig:
 
 
 def _anchor_dir(project_dir: Path) -> Path:
-    """Git root if inside a repo, otherwise *project_dir* itself."""
-    from contextzip.packager import _find_git_root
+    """The project root for *project_dir* — see root.find_project_root."""
+    from contextzip.root import find_project_root
 
-    git_root = _find_git_root(project_dir)
-    return git_root if git_root is not None else project_dir
+    return find_project_root(project_dir).root
 
 
 def project_config_path(project_dir: Path) -> Path:
@@ -302,6 +332,10 @@ def _parse_config_dict(data: dict) -> ProjectConfig:
     limits_config = _parse_limits_config(data.get("limits"))
     webui_config = _parse_webui_config(data.get("webui"))
     cleanup_config = _parse_cleanup_config(data.get("cleanup"))
+    snapshots_config = _parse_snapshots_config(data.get("snapshots"))
+    zip_guide = data.get("zip_guide", _DEFAULT_ZIP_GUIDE)
+    if not isinstance(zip_guide, bool):
+        zip_guide = _DEFAULT_ZIP_GUIDE
 
     applied_zip_retention = data.get("applied_zip_retention", _DEFAULT_APPLIED_ZIP_RETENTION)
     if (
@@ -321,6 +355,8 @@ def _parse_config_dict(data: dict) -> ProjectConfig:
         applied_zip_retention=applied_zip_retention,
         webui=webui_config,
         cleanup=cleanup_config,
+        snapshots=snapshots_config,
+        zip_guide=zip_guide,
     )
 
 
@@ -422,6 +458,22 @@ def _parse_cleanup_config(value: object) -> CleanupConfig:
     return CleanupConfig(
         enabled=enabled,
         keep_recent=keep_recent,
+    )
+
+
+def _parse_snapshots_config(value: object) -> SnapshotsConfig:
+    if not isinstance(value, dict):
+        return SnapshotsConfig()
+
+    def _int(key: str, default: int, minimum: int) -> int:
+        v = value.get(key, default)
+        if not isinstance(v, int) or isinstance(v, bool) or v < minimum:
+            return default
+        return v
+
+    return SnapshotsConfig(
+        keep=_int("keep", _DEFAULT_SNAPSHOTS_KEEP, 1),
+        max_age_days=_int("max_age_days", _DEFAULT_SNAPSHOTS_MAX_AGE_DAYS, 0),
     )
 
 

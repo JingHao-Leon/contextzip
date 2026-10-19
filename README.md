@@ -134,7 +134,7 @@ Describe your task in plain language and [Gemini](https://ai.google.dev/) picks 
 
 - **Setup:** you need a free Gemini API key. contextzip walks you through it the first time you use `--prompt`, or you can set the `GEMINI_API_KEY` environment variable.
 - **What is sent:** only the list of file **paths and sizes** that already passed the exclusion rules, plus your prompt. File contents never leave your machine.
-- **Fallback:** if Gemini is rate-limited or unreachable, a local keyword-based selector takes over, so `--prompt` keeps working.
+- **Fallback:** if Gemini is rate-limited, a local keyword-based selector takes over, so `--prompt` keeps working. Other errors (a bad key, no network) stop with a clear message.
 - **Model:** `gemini-2.5-flash-lite` by default.
 
 ### Applying AI changes back
